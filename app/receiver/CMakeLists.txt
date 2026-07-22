@@ -1,0 +1,2 @@
+add_executable(lowlat_receiver main.cpp)
+target_link_libraries(lowlat_receiver PRIVATE llcommon)

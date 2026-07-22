@@ -1,0 +1,2 @@
+add_executable(lowlat_server main.cpp)
+target_link_libraries(lowlat_server PRIVATE llcommon)
