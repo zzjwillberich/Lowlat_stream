@@ -22,6 +22,81 @@
 | 常量/宏 | 全大写下划线 | `MAX_PAYLOAD` |
 | 文件 | 与主类同名 | `JitterBuffer.h/.cpp` |
 
+## 注释
+
+采用 C++ 标准库风格的 Doxygen 注释，只注释**意图**（为什么这样做），不注释**语法**（做了什么）。
+
+- 多行文档用 `/** ... */`
+- 单行或简短说明用 `//`
+
+### 文件头
+
+```cpp
+/**
+ * @file    JitterBuffer.h
+ * @brief   乱序包排序与抖动缓冲，支持 FEC 恢复和 NACK 重传
+ * @author  zzj
+ * @date    2026-07-22
+ */
+```
+
+### 类
+
+```cpp
+/**
+ * 有界阻塞队列 —— 线程间唯一的数据通道。
+ *
+ * 生产者-消费者模型：
+ * - push() 队满阻塞，直到有空位或被 close() 唤醒。
+ * - pop()  队空阻塞，直到有数据或被 close() 唤醒。
+ * - close() 唤醒所有等待者，消费者可将残留数据取完后安全退出。
+ *
+ * @tparam T  队列元素类型，支持 move-only 类型（如 std::unique_ptr）
+ */
+template <typename T>
+class BoundedQueue { ... };
+```
+
+### 公开函数
+
+```cpp
+/**
+ * 向队列尾部插入一个元素。
+ *
+ * 若队列已满，调用线程阻塞等待；若队列已 close，立即返回 false。
+ *
+ * @param item  要插入的元素（接受右值，内部 move）
+ * @return  true  插入成功
+ *          false 队列已 close
+ * @note   多线程安全，可在任意线程调用
+ */
+bool push(T item);
+```
+
+### 私有实现
+
+```cpp
+// 唤醒所有阻塞在 notEmpty_ 上的消费者线程（在 close() / pop 成功时调用）
+void notifyConsumers();
+```
+
+### 行内注释
+
+```cpp
+// 先让消费者取完残留数据，再返回 false——直接丢弃会丢帧
+if (closed_ && q_.empty()) return false;
+```
+
+### 总结
+
+| 位置 | 风格 | 说明 |
+|---|---|---|
+| 文件头 | `/** @file @brief */` | 一句话概括文件职责 |
+| 类声明 | `/** ... @tparam */` | 说清设计意图和使用场景 |
+| 公开 API | `/** @param @return @note */` | 每个参数、返回值、副作用都要写 |
+| 私有函数 | `//` | 只写为什么、或非显而易见的细节 |
+| 行内 | `//` | 解释 tricky 逻辑，不写 `i++ // 自增` 这种废话 |
+
 ## 错误处理
 
 - **不用异常跨模块**：模块接口返回 `bool` 或 `Status`（错误码 + 消息）。
