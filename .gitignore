@@ -1,0 +1,8 @@
+build/
+*.o
+*.h264
+*.yuv
+*.mp4
+*.log
+.vscode/
+compile_commands.json
