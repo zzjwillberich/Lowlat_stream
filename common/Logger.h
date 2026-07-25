@@ -31,10 +31,18 @@ enum class LogLevel{ TRACE = 0, DEBUG, INFO, WARN, ERROR };
  */
 class Logger {
 public:
-    /** 全局唯一实例 (c++11 保证静态局部变量初始化的线程安全) */
+    /**
+     * @brief 全局唯一实例 (c++11 保证静态局部变量初始化的线程安全)
+     *
+     * @return Logger对象
+     */
     static Logger& instance();
 
-    /** 设置最低的输出级别, 低于该级别的消息被丢弃  */
+    /**
+     * @brief 设置最低的输出级别, 低于该级别的消息被丢弃
+     *
+     * @param lv 想要设置的LogLevel
+     */
     void setLevel(LogLevel lv);
 
     /** 格式化输出一条日志
@@ -52,10 +60,23 @@ public:
 private:
     Logger() = default;
 
-    /** 将 logLevel 转换为 5 字符右对齐的大写字符串 */
+    /**
+     * @brief 将 logLevel 转换为 5 字符右对齐的大写字符串
+     *
+     * @param lv 需要转化的LogLevel
+     *
+     * @return 大写 LogLevel字符串
+     */
     static const char* levelStr(LogLevel lv);
 
-    /** 格式化当前时间戳到 buf, 含毫秒: "YYYY-MM-DD HH:MM:SS.mmm" */
+    /**
+     * @brief 格式化当前时间戳到 buf, 含毫秒: "YYYY-MM-DD HH:MM:SS.mmm"
+     *
+     * @param buf 时间戳的缓冲区
+     * @param cap 缓冲区大小
+     *
+     * @return 装填时间戳后的缓冲区
+     */
     static void timestamp(char* buf ,size_t cap);
 
     std::mutex mu_;

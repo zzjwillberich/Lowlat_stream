@@ -15,5 +15,14 @@ add_executable(test_logger
 target_include_directories(test_logger PRIVATE ${PROJECT_SOURCE_DIR})
 target_link_libraries(test_logger PRIVATE gtest_main pthread)
 
+# ---------- Config 配置解析测试 ----------
+add_executable(test_config
+    test_config.cpp
+    ../common/Config.cpp
+)
+target_include_directories(test_config PRIVATE ${PROJECT_SOURCE_DIR})
+target_link_libraries(test_config PRIVATE gtest_main pthread)
+
 include(GoogleTest)
 gtest_discover_tests(test_logger)
+gtest_discover_tests(test_config)

@@ -6,3 +6,4 @@ build/
 *.log
 .vscode/
 compile_commands.json
+.cache/
