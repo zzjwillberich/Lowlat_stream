@@ -94,7 +94,6 @@ private:
      * @param value
      *
      * @return 解析成功的参数个数
-     *  -1 解析到 -- 停止解析后续参数
      */
     int parseOne(const std::string& arg, const char* nextArg,std::string& key,std::string& value);
 

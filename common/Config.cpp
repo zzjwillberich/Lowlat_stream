@@ -32,7 +32,7 @@ int Config::parseOne(const std::string& arg, const char* nextArg, std::string& k
     //去掉前面的 --
     std::string body = arg.substr(2);
 
-    if(body.empty()) return -1;
+    if(body.empty()) return 1;
 
     // 查找等号的位置
     size_t eqPos = body.find('=');
@@ -74,10 +74,6 @@ bool Config::parse(int argc,char** argv){
             std::fprintf(stderr, "Unknown argument %s\n", argv[i]);
             printUsage();
             return false;
-        }
-
-        if(consumed == -1){
-            return true;
         }
 
         // 处理内置指令
@@ -183,9 +179,10 @@ void Config::printUsage() const {
         "Usage: lowlat_<app> [options]\n"
         "Options:\n"
         "  --help                Show this help and exit\n"
+        "  --config <file>       Load config file (key=value per line)\n"
+        
         "  --log-level <level>   Log level: trace/debug/info/warn/error "
         "(default: info)\n"
-        "  --config <file>       Load config file (key=value per line)\n"
         "  --listen <addr:port>  Listen address (default: 0.0.0.0:9000)\n"
         "  --target <addr:port>  Target address (default: 127.0.0.1:9000)\n"
     );
