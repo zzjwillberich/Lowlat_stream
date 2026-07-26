@@ -48,9 +48,11 @@ TEST(LoggerThreadSafety, NoInterleavedLines) {
     ASSERT_TRUE(in.is_open());
 
     // 合法的日志行格式：
-    // [2026-07-23 17:48:01.998][INFO][test] thread 0 msg 0
+    // [2026-07-23 17:48:01.998][INFO ][test] thread 0 msg 0
+    // 级别一律占 5 字符（INFO/WARN 右补一个空格），这里把对齐规则一并钉死，
+    // 以后谁改了 levelStr 的补白，这条用例会直接报出来
     std::regex linePattern(
-        R"(^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\]\[(TRACE|DEBUG|INFO|WARN|ERROR)\]\[test\] .+)"
+        R"(^\[\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{3}\]\[(TRACE|DEBUG|INFO |WARN |ERROR)\]\[test\] .+)"
     );
 
     std::string line;
