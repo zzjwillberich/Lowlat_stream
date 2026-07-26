@@ -1,0 +1,5 @@
+# 让 clangd 直接读 build/ 下由 CMAKE_EXPORT_COMPILE_COMMANDS 生成的编译数据库,
+# 不要再往根目录手工拷贝副本 —— 副本一旦过期(新增源文件、新增 FetchContent 依赖),
+# clangd 就会拿着旧的 include 路径报一堆找不到头文件的假错误。
+CompileFlags:
+  CompilationDatabase: build
