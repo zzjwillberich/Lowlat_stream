@@ -13,6 +13,17 @@
 #include <chrono>
 #include <mutex>
 
+LogLevel parseLogLevel(const std::string& s){
+    if(s == "trace") return LogLevel::TRACE;
+    if(s == "debug") return LogLevel::DEBUG;
+    if(s == "info")  return LogLevel::INFO;
+    if(s == "warn")  return LogLevel::WARN;
+    if(s == "error") return LogLevel::ERROR;
+
+    LOG_WARN("config", "unknown log level '%s', falling back to info", s.c_str());
+    return LogLevel::INFO;
+}
+
 Logger&  Logger::instance(){
     static Logger inst;
     return inst;
@@ -46,7 +57,7 @@ void Logger::log(LogLevel lv, const char* module, const char* fmt, ...){
 }
 
 const char* Logger::levelStr(LogLevel lv){
-    static const char* names[] = {"TRACE", "DEBUG", "INFO", "WARN", "ERROR"};
+    static const char* names[] = {"TRACE", "DEBUG", "INFO ", "WARN ", "ERROR"};
     int idx = static_cast<int>(lv);
     if(idx < 0 || idx > 4) return "???? ";
     return names[idx];

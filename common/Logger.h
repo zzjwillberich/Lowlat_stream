@@ -8,6 +8,7 @@
 
 #include <mutex>
 #include <atomic>
+#include <string>
 
 #include <cstdio>
 
@@ -18,6 +19,18 @@
  * 即 TRACE/DEBUG 在 Release 模式下零开销 (会在加锁前过滤)
  */
 enum class LogLevel{ TRACE = 0, DEBUG, INFO, WARN, ERROR };
+
+/**
+ * @brief string 转 LogLevel, 供 --log-level 等配置项使用
+ *
+ * @param s LogLevel 字符串, 小写: trace/debug/info/warn/error
+ *
+ * @return 对应的 LogLevel 枚举值
+ *
+ * @note 不认识的值退回 INFO 并打一条 WARN, 而不是拒绝启动:
+ *          否则 --log-level=debgu 这类拼写错误会表现为"日志系统坏了"
+ */
+LogLevel parseLogLevel(const std::string& s);
 
 /**
  * 线程安全的单例模式日志器
