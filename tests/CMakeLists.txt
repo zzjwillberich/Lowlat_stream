@@ -7,22 +7,19 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(googletest)
 
-# ---------- 日志线程安全测试 ----------
-add_executable(test_logger
-    test_logger.cpp
-    ../common/Logger.cpp
-)
-target_include_directories(test_logger PRIVATE ${PROJECT_SOURCE_DIR})
-target_link_libraries(test_logger PRIVATE gtest_main pthread)
-
-# ---------- Config 配置解析测试 ----------
-add_executable(test_config
-    test_config.cpp
-    ../common/Config.cpp
-)
-target_include_directories(test_config PRIVATE ${PROJECT_SOURCE_DIR})
-target_link_libraries(test_config PRIVATE gtest_main pthread)
-
 include(GoogleTest)
-gtest_discover_tests(test_logger)
-gtest_discover_tests(test_config)
+
+# 测试目标统一链接 llcommon, 不再逐个编译 ../common/*.cpp:
+# 否则 common 每加一个源文件都得同步改这里, 迟早漏。
+# include 路径和 pthread 由 llcommon 以 PUBLIC 方式传递过来, 无需重复声明。
+function(add_unit_test name)
+    add_executable(${name} ${name}.cpp)
+    target_link_libraries(${name} PRIVATE gtest_main llcommon)
+    # 阻塞类用例万一没被唤醒, future 析构会永久阻塞;
+    # 这里兜一层硬超时, 让挂死表现为"测试失败"而不是"整条流水线卡住"
+    gtest_discover_tests(${name} PROPERTIES TIMEOUT 30)
+endfunction()
+
+add_unit_test(test_logger)          # 日志线程安全
+add_unit_test(test_config)          # 配置解析
+add_unit_test(test_bounded_queue)   # 有界队列
