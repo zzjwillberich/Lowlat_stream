@@ -61,7 +61,7 @@ public:
     /** 格式化输出一条日志
      *
      * @param lv        本条日志级别
-     * @param moudle    模块名, 输出时右对齐 5 字符
+     * @param module    模块名, 原样输出
      * @param fmt       printf 风格格式串
      * @param ...       可变参数
      *

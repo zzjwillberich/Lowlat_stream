@@ -180,7 +180,6 @@ void Config::printUsage() const {
         "Options:\n"
         "  --help                Show this help and exit\n"
         "  --config <file>       Load config file (key=value per line)\n"
-        
         "  --log-level <level>   Log level: trace/debug/info/warn/error "
         "(default: info)\n"
         "  --listen <addr:port>  Listen address (default: 0.0.0.0:9000)\n"
