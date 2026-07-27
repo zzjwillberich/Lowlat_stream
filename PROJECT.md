@@ -73,3 +73,4 @@
 - [docs/PROTOCOL.md](docs/PROTOCOL.md) — 自研协议设计
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — 模块与线程模型
 - [docs/CONVENTIONS.md](docs/CONVENTIONS.md) — 工程规范
+- [docs/NOTES.md](docs/NOTES.md) — 踩坑记录
