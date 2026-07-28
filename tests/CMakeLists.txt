@@ -23,3 +23,4 @@ endfunction()
 add_unit_test(test_logger)          # 日志线程安全
 add_unit_test(test_config)          # 配置解析
 add_unit_test(test_bounded_queue)   # 有界队列
+add_unit_test(test_frame)           # 帧类型与采集接口契约

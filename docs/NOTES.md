@@ -241,3 +241,61 @@ CompileFlags:
 `test_logger` 用正则匹配 `[时间][级别][模块]`，其中级别是**5 字符右对齐**（`INFO ` 带一个尾空格）。
 这不是坑，是**有意的**：格式是对外契约（后面 M6 要靠脚本解析日志算指标），
 改格式就该让测试拦下来，而不是悄悄改完等下游解析崩。
+
+---
+
+## M1 · 采集 + 编码
+
+### 14. 只 `= delete` 拷贝，会把移动一起弄没
+
+**现象**
+`RawFrame` 想做成"禁止拷贝、允许移动"，于是先写了两行：
+
+```cpp
+RawFrame(const RawFrame&) = delete;
+RawFrame& operator=(const RawFrame&) = delete;
+```
+
+结果 `RawFrame b = std::move(a);` 编译失败，而且报的是**拷贝**构造函数：
+
+```
+error: use of deleted function 'RawFrame::RawFrame(const RawFrame&)'
+note: declared here
+    RawFrame(const RawFrame&) = delete;
+```
+
+明明写的是 `std::move`，报错却指向拷贝——第一眼完全看不懂。
+
+**原因**
+两步：
+
+1. **只要声明了拷贝构造/拷贝赋值（哪怕是 `= delete`），编译器就不再隐式生成移动构造/移动赋值。**
+   于是 `RawFrame` 压根没有移动构造函数。
+2. `std::move(a)` 产生一个右值，重载决议里唯一能接住它的是 `const RawFrame&`
+   （const 左值引用可以绑右值），而它恰好是 deleted → 报错，且报的是拷贝版本。
+
+反过来也成立：声明了移动构造，拷贝构造会被自动 delete。这就是**五法则**——
+拷贝构造、拷贝赋值、移动构造、移动赋值、析构，一旦手写其中任何一个，
+其余几个的默认生成规则就会变，最稳妥的做法是**要么一个都别写（零法则），要么写全**。
+
+**做法**
+四行成套写，缺一不可：
+
+```cpp
+RawFrame(const RawFrame&)            = delete;   // 3MB 一帧, 隐式拷贝是无声的性能陷阱
+RawFrame& operator=(const RawFrame&) = delete;
+RawFrame(RawFrame&&)            = default;       // 队列靠 move 交接所有权
+RawFrame& operator=(RawFrame&&) = default;
+```
+
+并在单测里用 `static_assert` 钉住这四条性质（见 `tests/test_frame.cpp`），
+哪天有人手滑删掉 move 那两行，编译期立刻指出问题，而不是等到调用点报一句
+看不懂的 "use of deleted function"。
+
+这就是 **move-only 类型**的标准写法，`unique_ptr` / `thread` / `fstream` / `mutex`
+全是这个路子：资源天然独占，拷贝没有合理语义，但所有权可以转交。
+
+**附带一个坑**：`= default` 生成的是**逐成员移动**。`data`（vector）被偷走指针变空，
+但 `width` / `height` / `frameId` 这些标量是**照抄**过去的——被 move 走的帧会
+"自称 64×32 却一个字节数据都没有"。所以 move 之后不要再读那个对象，要用先 `reset()`。
+流水线里全程传 `unique_ptr<RawFrame>`，正是为了根本不出现这种半空对象。
