@@ -24,7 +24,9 @@ namespace {
         return key == "log-level" || key == "listen" || key == "target"
             // M1 采集参数
             || key == "source" || key == "device" || key == "width" || key == "height"
-            || key == "fps" || key == "frames" || key == "dump-raw";
+            || key == "fps" || key == "frames" || key == "dump-raw"
+            // M1 编码参数
+            || key == "dump" || key == "bitrate" || key == "gop";
     }
 }
 
@@ -195,5 +197,9 @@ void Config::printUsage() const {
         "  --fps <n>             Capture frame rate (default: 30)\n"
         "  --frames <n>          Stop after N frames (default: 100)\n"
         "  --dump-raw <file>     Write raw YUV420P frames to file\n"
+        "Encode (sender):\n"
+        "  --dump <file>         Encode to H.264 Annex B and write to file\n"
+        "  --bitrate <kbps>      Target bitrate in kbps (default: 2000)\n"
+        "  --gop <n>             Key frame interval in frames (default: fps)\n"
     );
 }
