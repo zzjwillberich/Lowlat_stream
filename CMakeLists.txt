@@ -11,6 +11,7 @@ endif()
 add_compile_options(-Wall -Wextra)
 
 add_subdirectory(common)
+add_subdirectory(modules/capture)
 add_subdirectory(app/sender)
 add_subdirectory(app/receiver)
 add_subdirectory(app/server)

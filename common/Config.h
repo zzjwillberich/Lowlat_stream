@@ -19,7 +19,7 @@
  *  3. 硬编码默认值 调用 get(key, default) 时的第二个参数
  *
  * @note
- *  - 命令行仅接受 --help、--log-level、--config、--listen、--target
+ *  - 命令行只接受白名单内的参数(见 Config.cpp 的 isSupportedOption 与 printUsage)
  *  - 未知参数报错并打印用法，不静默忽略
  */
 class Config{

@@ -21,7 +21,10 @@ namespace {
     }
 
     bool isSupportedOption(const std::string& key) {
-        return key == "log-level" || key == "listen" || key == "target";
+        return key == "log-level" || key == "listen" || key == "target"
+            // M1 采集参数
+            || key == "source" || key == "device" || key == "width" || key == "height"
+            || key == "fps" || key == "frames" || key == "dump-raw";
     }
 }
 
@@ -184,5 +187,13 @@ void Config::printUsage() const {
         "(default: info)\n"
         "  --listen <addr:port>  Listen address (default: 0.0.0.0:9000)\n"
         "  --target <addr:port>  Target address (default: 127.0.0.1:9000)\n"
+        "Capture (sender):\n"
+        "  --source <kind>       Capture source: null/v4l2 (default: null)\n"
+        "  --device <path>       V4L2 device node (default: /dev/video0)\n"
+        "  --width <n>           Frame width, must be even (default: 640)\n"
+        "  --height <n>          Frame height, must be even (default: 480)\n"
+        "  --fps <n>             Capture frame rate (default: 30)\n"
+        "  --frames <n>          Stop after N frames (default: 100)\n"
+        "  --dump-raw <file>     Write raw YUV420P frames to file\n"
     );
 }
