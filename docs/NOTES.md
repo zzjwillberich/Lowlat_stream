@@ -366,3 +366,43 @@ M3 算出的 p50/p95 本身就不准——**测量工具自己先漂了**。
 
 > 通用结论：任何周期性的东西（定时器、心跳、pacing 发包、码率控制）都不要拿
 > "上一次的时间"当基准，要拿一个固定原点。
+
+---
+
+### 16. 编码结束前必须发送空帧排空编码器
+
+**现象**
+所有输入帧都已经通过 `avcodec_send_frame()` 送入编码器，但直接关闭编码器后，输出视频的
+最后几帧消失，时长比预期短；使用 B 帧或带 lookahead 的编码器时更容易出现。
+
+**原因**
+编码器不保证“输入一帧，立刻输出一个包”。为了 B 帧重排、帧间预测和码率分析，编码器可能
+在内部暂存若干输入帧。送完最后一张正常帧只表示“目前没有继续送”，不表示“以后不会再送”，
+所以编码器不能主动把依赖后续输入的状态收尾。此时直接 `avcodec_free_context()`，内部尚未输出的
+编码包会被直接丢弃。
+
+`avcodec_send_frame(ctx, nullptr)` 里的 `nullptr` **不是一张黑帧**，而是 EOF/排空信号：
+告诉编码器不会再有输入，让它进入 draining 状态并输出所有剩余包。
+
+**做法**
+正常结束时先发送一次 `nullptr`，然后持续接收，直到 `avcodec_receive_packet()` 返回
+`AVERROR_EOF`：
+
+```cpp
+int rc = avcodec_send_frame(ctx_, nullptr);
+if (rc < 0 && rc != AVERROR_EOF) {
+    return Status::error(Code::Internal,
+                         "avcodec_send_frame(nullptr) failed: " + avErr(rc));
+}
+
+// flush 之后必须一直 drain 到 AVERROR_EOF，不能只收到 EAGAIN 就当作完成。
+return drainPackets(out);
+```
+
+注意三个边界：
+
+- 发送 `nullptr` 后已经进入 draining 状态，不能再发送普通帧；想重新开始要重置或重建上下文。
+- `drainPackets()` 在普通编码阶段可以遇到 `AVERROR(EAGAIN)` 就返回；进入 draining 状态后则应
+  一直接收到 `AVERROR_EOF`，此时正常流程不应再返回 `EAGAIN`。
+- 不要用 `avcodec_flush_buffers()` 替代。前者的目标是**取完剩余输出**，后者是**重置内部状态**，
+  可能直接丢掉尚未输出的数据。
