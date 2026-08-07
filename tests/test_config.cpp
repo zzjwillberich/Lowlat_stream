@@ -198,3 +198,12 @@ TEST(Config, LogLevelDefaultInfo) {
     ASSERT_TRUE(cfg.parse(1, const_cast<char**>(argv)));
     EXPECT_EQ(cfg.get("log-level", "info"), "info");
 }
+
+// ========== M1.4 sender 队列容量 ==========
+
+TEST(Config, SenderQueueCapacityIsRegistered) {
+    const char* argv[] = {"prog", "--cap=7"};
+    Config cfg;
+    ASSERT_TRUE(cfg.parse(2, const_cast<char**>(argv)));
+    EXPECT_EQ(cfg.getInt("cap", 4), 7);
+}

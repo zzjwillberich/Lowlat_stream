@@ -26,7 +26,7 @@ namespace {
             || key == "source" || key == "device" || key == "width" || key == "height"
             || key == "fps" || key == "frames" || key == "dump-raw"
             // M1 编码参数
-            || key == "dump" || key == "bitrate" || key == "gop";
+            || key == "dump" || key == "bitrate" || key == "gop" || key == "cap";
     }
 }
 
@@ -201,5 +201,6 @@ void Config::printUsage() const {
         "  --dump <file>         Encode to H.264 Annex B and write to file\n"
         "  --bitrate <kbps>      Target bitrate in kbps (default: 2000)\n"
         "  --gop <n>             Key frame interval in frames (default: fps)\n"
+        "  --cap <n>             Raw frame queue capacity (default: 4)\n"
     );
 }
