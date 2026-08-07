@@ -27,3 +27,4 @@ add_unit_test(test_bounded_queue)   # 有界队列
 add_unit_test(test_frame)                      # 帧类型与采集接口契约
 add_unit_test(test_null_source llcapture)      # 合成画面源
 add_unit_test(test_encoder llencode)           # H.264 编码器
+add_unit_test(test_sender_pipeline llsender)   # M1.4 采集 -> 队列 -> 编码管线
