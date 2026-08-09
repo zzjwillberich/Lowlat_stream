@@ -12,7 +12,6 @@
 #include "modules/capture/Frame.h"
 #include "modules/encode/Encoder.h"
 
-#include <cstddef>
 #include <cstdint>
 #include <fcntl.h>
 #include <memory>

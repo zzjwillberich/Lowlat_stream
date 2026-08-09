@@ -74,12 +74,24 @@ public:
     virtual Status open(const SourceConfig& cfg) = 0;
 
     /**
+     * @brief 获取采集源实际使用的参数
+     *
+     * @return 最近一次成功 open 后协商得到的配置
+     *
+     * @note 摄像头驱动可以修改请求的宽高和帧率，所以返回值不一定等于传给 open() 的 cfg。
+     *          sender 必须在 source open 成功后读取这里的实际值，再据此打开 encoder。
+     * @note 仅保证在 open() 成功后、close() 之前有效；调用方不得保存该引用跨越 close()。
+     */
+    virtual const SourceConfig& actualConfig() const = 0;
+
+    /**
      * @brief 阻塞取一帧
      *
      * @param out 出参, 被填充为最新一帧; 内部会 reset() 到实际分辨率
      *
      * @return Ok      取到一帧
      *  Closed  源已正常结束(如 close() 被调用), 调用方应正常收尾退出
+     *  Timeout 等待设备帧超时, 调用方可选择重试或退出
      *  IoError 设备出错, 需要重新 open
      *
      * @note 用 Status 而不是 bool, 就是为了让调用方能区分**正常结束**和**设备炸了**:

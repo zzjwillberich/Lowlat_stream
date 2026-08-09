@@ -29,6 +29,7 @@ public:
     NullSource() = default;
 
     Status open(const SourceConfig& cfg) override;
+    const SourceConfig& actualConfig() const override { return cfg_; }
     Status readFrame(RawFrame& out) override;
     void   close() override;
 

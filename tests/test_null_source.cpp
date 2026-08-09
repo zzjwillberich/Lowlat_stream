@@ -108,6 +108,18 @@ TEST(NullSource, FrameHasRequestedGeometry) {
     EXPECT_EQ(f.data.size(), frameBytes(64, 32));
 }
 
+TEST(NullSource, ActualConfigMatchesOpenedConfig) {
+    NullSource src;
+    const SourceConfig requested = cfg(128, 64, 50);
+    ASSERT_TRUE(src.open(requested).isOk());
+
+    const SourceConfig& actual = src.actualConfig();
+    EXPECT_EQ(actual.width, requested.width);
+    EXPECT_EQ(actual.height, requested.height);
+    EXPECT_EQ(actual.fps, requested.fps);
+    EXPECT_EQ(actual.device, requested.device);
+}
+
 TEST(NullSource, FrameIdIncrementsAndTimeAdvances) {
     NullSource src;
     ASSERT_TRUE(src.open(cfg()).isOk());

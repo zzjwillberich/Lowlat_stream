@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <future>
@@ -18,6 +19,7 @@
 #include <unistd.h>
 
 #include "app/sender/SenderPipeline.h"
+#include "common/Clock.h"
 #include "modules/capture/NullSource.h"
 
 using namespace std::chrono_literals;
@@ -59,6 +61,43 @@ namespace {
         cfg.maxFrames = frames;
         return cfg;
     }
+
+    /**
+     * 模拟“驱动没有接受请求分辨率”的采集源。
+     *
+     * open 请求 640x480，但实际只提供 320x240。管线必须在 source open 后读取
+     * actualConfig()，再以 320x240 打开 encoder；继续使用请求值会在 encode() 时报尺寸不匹配。
+     */
+    class NegotiatingSource : public ISource {
+    public:
+        Status open(const SourceConfig& requested) override {
+            actual_ = requested;
+            actual_.width = 320;
+            actual_.height = 240;
+            opened_ = true;
+            frameId_ = 0;
+            return Status::ok();
+        }
+
+        const SourceConfig& actualConfig() const override { return actual_; }
+
+        Status readFrame(RawFrame& out) override {
+            if (!opened_) return Status::error(Code::Closed, "NegotiatingSource: not opened");
+
+            out.reset(actual_.width, actual_.height);
+            std::fill(out.data.begin(), out.data.end(), static_cast<uint8_t>(128));
+            out.captureMs = steadyNowMs();
+            out.frameId = frameId_++;
+            return Status::ok();
+        }
+
+        void close() override { opened_ = false; }
+
+    private:
+        SourceConfig actual_;
+        bool opened_ = false;
+        uint64_t frameId_ = 0;
+    };
 }  // namespace
 
 TEST(SenderPipeline, RejectsInvalidQueueCapacity) {
@@ -121,4 +160,21 @@ TEST(SenderPipeline, CannotRunTwiceAfterQueueHasClosed) {
 
     ASSERT_TRUE(pipeline.run(stop).isOk());
     EXPECT_EQ(pipeline.run(stop).code(), Code::InvalidArg);
+}
+
+TEST(SenderPipeline, OpensEncoderWithSourceNegotiatedGeometry) {
+    constexpr int FRAMES = 5;
+    SenderPipelineConfig cfg = pipelineConfig(FRAMES);
+    cfg.source.width = 640;
+    cfg.source.height = 480;
+    cfg.encoder.width = cfg.source.width;
+    cfg.encoder.height = cfg.source.height;
+
+    SenderPipeline pipeline(std::make_unique<NegotiatingSource>(), cfg);
+    const std::atomic<bool> stop{false};
+
+    ASSERT_TRUE(pipeline.run(stop).isOk())
+        << "source open 后应使用 actualConfig() 覆盖 encoder 的宽高和帧率";
+    EXPECT_EQ(pipeline.stats().capturedFrames, static_cast<uint64_t>(FRAMES));
+    EXPECT_EQ(pipeline.stats().encodedFrames, static_cast<uint64_t>(FRAMES));
 }
