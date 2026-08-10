@@ -8,6 +8,7 @@
 #include "app/sender/SenderPipeline.h"
 #include "common/BoundedQueue.h"
 #include "common/Clock.h"
+#include "common/Logger.h"
 #include "common/Status.h"
 #include "modules/capture/Frame.h"
 #include "modules/encode/Encoder.h"
@@ -116,6 +117,24 @@ Status SenderPipeline::openResources() {
         closeResources();
         return st;
     }
+
+    // 摄像头驱动可以不理会请求值, 只给相近的分辨率/帧率。编码器必须按**实际**参数打开:
+    // 按 640x480 开的编码器喂进 320x240 的帧, 出来的不是报错而是花屏 —— 更难查。
+    const SourceConfig& actual = source_->actualConfig();
+    if(actual.width != config_.encoder.width || actual.height != config_.encoder.height ||
+       actual.fps != config_.encoder.fps) {
+        LOG_INFO("sender",
+                 "source negotiated %dx%d@%dfps (requested %dx%d@%dfps), "
+                 "opening encoder with the negotiated values",
+                 actual.width, actual.height, actual.fps,
+                 config_.encoder.width, config_.encoder.height, config_.encoder.fps);
+    }
+
+    // 覆盖 config_ 本身而不是用局部变量: 之后的日志和统计读到的都应该是真正在跑的参数,
+    // 留着一份对不上的"请求值"迟早会有人拿它去算东西。
+    config_.encoder.width = actual.width;
+    config_.encoder.height = actual.height;
+    config_.encoder.fps = actual.fps;
 
     st = encoder_.open(config_.encoder);
     if(!st.isOk()) {
