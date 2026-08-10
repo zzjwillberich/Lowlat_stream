@@ -18,6 +18,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <linux/videodev2.h>
+#include <limits>
 #include <poll.h>
 #include <string>
 #include <sys/ioctl.h>
@@ -39,7 +40,40 @@ Status V4l2Source::open(const SourceConfig& cfg) {
     if(!st.isOk()) return st;
 
     requestedCfg_ = cfg;
-    actualCfg_ = actualConfig();
+    actualCfg_ = cfg;
+
+    st = openAndQueryDevice();
+    if(!st.isOk()) {
+        close();
+        return st;
+    }
+
+    st = negotiateFormatAndRate();
+    if(!st.isOk()) {
+        close();
+        return st;
+    }
+
+    st = createConverter();
+    if(!st.isOk()) {
+        close();
+        return st;
+    }
+
+    st = mapBuffers();
+    if(!st.isOk()) {
+        close();
+        return st;
+    }
+
+    st = startStreaming();
+    if(!st.isOk()) {
+        close();
+        return st;
+    }
+
+    frameId_ = 0;
+    opened_ = true;
     return Status::ok();
 }
 
@@ -269,37 +303,294 @@ Status V4l2Source::negotiateFormatAndRate() {
 }
 
 Status V4l2Source::createConverter() {
-    // TODO(M1.5): 只创建一次 SwsContext，输入 YUYV422，输出 YUV420P。
-    return Status::error(Code::Internal,
-                         "V4l2Source::createConverter is not implemented (M1.5)");
+    if(sws_){
+        return Status::error(
+            Code::Internal,
+            "V4l2Source: converter context already exists before initialization"
+        );
+    }
+
+    if(actualCfg_.width <= 0 || actualCfg_.height <= 0 ||
+       actualCfg_.width % 2 != 0 || actualCfg_.height % 2 != 0) {
+        return Status::error(
+            Code::Internal,
+            "V4l2Source: invalid negotiated geometry for converter: " +
+                std::to_string(actualCfg_.width) + "x" +
+                std::to_string(actualCfg_.height)
+        );
+    }
+
+    if(devicePixelFormat_ != V4L2_PIX_FMT_YUYV){
+        return Status::error(
+            Code::Internal,
+            "V4l2Source: cannot create converter for device pixel format " +
+                std::to_string(devicePixelFormat_) + "; expected YUYV"
+        );
+    }
+
+    sws_ = sws_getContext(
+        actualCfg_.width, 
+        actualCfg_.height, 
+        AVPixelFormat::AV_PIX_FMT_YUYV422,
+        actualCfg_.width, 
+        actualCfg_.height, 
+        AVPixelFormat::AV_PIX_FMT_YUV420P, 
+        SWS_FAST_BILINEAR,
+        nullptr, 
+        nullptr, 
+        nullptr
+    );
+
+    if(sws_ == nullptr){
+        return Status::error(
+            Code::Internal,
+            "V4l2Source: sws_getContext failed for YUYV422 to YUV420P conversion at " +
+                std::to_string(actualCfg_.width) + "x" +
+                std::to_string(actualCfg_.height)
+        );
+    }
+
+    return Status::ok();
 }
 
 Status V4l2Source::mapBuffers() {
-    // TODO(M1.5): REQBUFS(建议 4) -> QUERYBUF -> mmap；部分失败也必须能由 close 回收。
-    return Status::error(Code::Internal,
-                         "V4l2Source::mapBuffers is not implemented (M1.5)");
+    v4l2_requestbuffers req{};
+    req.count = 4;
+    req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    req.memory = V4L2_MEMORY_MMAP;
+
+    if(xioctl(fd_, VIDIOC_REQBUFS, &req) < 0){
+        return Status::error(
+            Code::IoError,
+            "V4l2Source: VIDIOC_REQBUFS failed for device '" +
+                requestedCfg_.device + "': " +
+                std::string(std::strerror(errno))
+        );
+    }
+    if(req.count == 0){
+        return Status::error(
+            Code::IoError,
+            "V4l2Source: VIDIOC_REQBUFS returned no MMAP buffers for device '" +
+                requestedCfg_.device + "'"
+        );
+    }
+
+    buffers_.reserve(req.count);
+    for(uint32_t i = 0; i < req.count; ++i){
+        v4l2_buffer buf{};
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.index = i;
+
+        if(xioctl(fd_, VIDIOC_QUERYBUF, &buf) < 0){
+            return Status::error(
+                Code::IoError,
+                "V4l2Source: VIDIOC_QUERYBUF failed for buffer " +
+                    std::to_string(i) + ": " +
+                    std::string(std::strerror(errno))
+            );
+        }
+        if(buf.length == 0){
+            return Status::error(
+                Code::IoError,
+                "V4l2Source: VIDIOC_QUERYBUF returned zero length for buffer " +
+                    std::to_string(i)
+            );
+        }
+
+        void* start = mmap(
+            nullptr,
+            buf.length,
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED,
+            fd_,
+            buf.m.offset
+        );
+
+        if(start == MAP_FAILED){
+            return Status::error(
+                Code::IoError,
+                "V4l2Source: mmap failed for buffer " + std::to_string(i) +
+                    " (length=" + std::to_string(buf.length) + "): " +
+                    std::string(std::strerror(errno))
+            );
+        }
+
+        MappedBuffer mbuf{start,buf.length};
+        buffers_.push_back(mbuf);
+    }
+    return Status::ok();
 }
 
 Status V4l2Source::startStreaming() {
-    // TODO(M1.5): 先 QBUF 所有 buffer，再 VIDIOC_STREAMON；成功后设置 streaming_。
-    return Status::error(Code::Internal,
-                         "V4l2Source::startStreaming is not implemented (M1.5)");
+    if(fd_ < 0){
+        return Status::error(
+          Code::Internal,
+          "V4l2Source: cannot start streaming with an invalid device fd"
+        );
+    }
+    if(buffers_.empty()){
+        return Status::error(
+            Code::Internal,
+            "V4l2Source: cannot start streaming without mapped buffers"
+        );
+    }
+
+    for(uint32_t i = 0; i < buffers_.size(); ++i){
+        v4l2_buffer buf{};
+        buf.memory = V4L2_MEMORY_MMAP;
+        buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.index = i;
+        if(xioctl(fd_, VIDIOC_QBUF, &buf) < 0){
+            return Status::error(
+                Code::IoError,
+                "V4l2Source: VIDIOC_QBUF failed for buffer " +
+                    std::to_string(i) + ": " +
+                    std::string(std::strerror(errno))
+            );
+        }
+    }
+
+    v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if(xioctl(fd_, VIDIOC_STREAMON, &type) < 0){
+        return Status::error(
+            Code::IoError,
+            "V4l2Source: VIDIOC_STREAMON failed for device '" +
+                requestedCfg_.device + "': " +
+                std::string(std::strerror(errno))
+        );
+    }
+
+    streaming_ = true;
+    return Status::ok();
 }
 
 Status V4l2Source::waitForFrame() const {
-    // TODO(M1.5): poll(POLLIN|POLLPRI)，EINTR 重试，POLLERR/HUP/NVAL 返回 IoError。
-    return Status::error(Code::Internal,
-                         "V4l2Source::waitForFrame is not implemented (M1.5)");
+    if(fd_ < 0) {
+        return Status::error(Code::Internal,
+                             "V4l2Source: cannot wait for a frame with an invalid device fd");
+    }
+
+    pollfd pfd{};
+    pfd.fd = fd_;
+    pfd.events = POLLIN | POLLPRI;
+
+    for(;;) {
+        pfd.revents = 0;
+        const int rc = ::poll(&pfd, 1, POLL_TIMEOUT_MS);
+
+        if(rc < 0 && errno == EINTR) {
+            continue;
+        }
+        if(rc < 0) {
+            return Status::error(Code::IoError,
+                                 "V4l2Source: poll failed for device '" +
+                                     requestedCfg_.device + "': " +
+                                     std::string(std::strerror(errno)));
+        }
+        if(rc == 0) {
+            return Status::error(Code::Timeout,
+                                 "V4l2Source: timed out after " +
+                                     std::to_string(POLL_TIMEOUT_MS) +
+                                     " ms waiting for a frame from device '" +
+                                     requestedCfg_.device + "'");
+        }
+
+        if(pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            return Status::error(Code::IoError,
+                                 "V4l2Source: poll reported device error events=" +
+                                     std::to_string(static_cast<int>(pfd.revents)) +
+                                     " for device '" + requestedCfg_.device + "'");
+        }
+        if(pfd.revents & (POLLIN | POLLPRI)) {
+            return Status::ok();
+        }
+
+        return Status::error(Code::IoError,
+                             "V4l2Source: poll returned unexpected events=" +
+                                 std::to_string(static_cast<int>(pfd.revents)) +
+                                 " for device '" + requestedCfg_.device + "'");
+    }
 }
 
 Status V4l2Source::convertFrame(const void* data, size_t bytesUsed, RawFrame& out) {
-    (void)data;
-    (void)bytesUsed;
-    (void)out;
+    if(data == nullptr) {
+        return Status::error(Code::Internal,
+                             "V4l2Source: cannot convert a null capture buffer");
+    }
+    if(sws_ == nullptr) {
+        return Status::error(Code::Internal,
+                             "V4l2Source: cannot convert a frame without a SwsContext");
+    }
+    if(actualCfg_.width <= 0 || actualCfg_.height <= 0 ||
+       actualCfg_.width % 2 != 0 || actualCfg_.height % 2 != 0) {
+        return Status::error(Code::Internal,
+                             "V4l2Source: invalid negotiated geometry during conversion: " +
+                                 std::to_string(actualCfg_.width) + "x" +
+                                 std::to_string(actualCfg_.height));
+    }
+    if(out.width != actualCfg_.width || out.height != actualCfg_.height ||
+       out.fmt != PixelFormat::YUV420P ||
+       out.data.size() != frameBytes(actualCfg_.width, actualCfg_.height)) {
+        return Status::error(Code::Internal,
+                             "V4l2Source: output frame was not initialized for negotiated "
+                             "YUV420P geometry " +
+                                 std::to_string(actualCfg_.width) + "x" +
+                                 std::to_string(actualCfg_.height));
+    }
 
-    // TODO(M1.5): 校验 bytesUsed >= width*height*2，并按 out 的三个平面/stride 调 sws_scale。
-    return Status::error(Code::Internal,
-                         "V4l2Source::convertFrame is not implemented (M1.5)");
+    const size_t rowBytes = static_cast<size_t>(actualCfg_.width) * 2;
+    if(bytesperline_ < rowBytes ||
+       bytesperline_ > static_cast<size_t>(std::numeric_limits<int>::max())) {
+        return Status::error(Code::Internal,
+                             "V4l2Source: invalid YUYV input stride " +
+                                 std::to_string(bytesperline_) +
+                                 " for width " + std::to_string(actualCfg_.width));
+    }
+
+    const size_t rowsBeforeLast = static_cast<size_t>(actualCfg_.height - 1);
+    if(rowsBeforeLast > 0 &&
+       bytesperline_ > (std::numeric_limits<size_t>::max() - rowBytes) /
+                           rowsBeforeLast) {
+        return Status::error(Code::Internal,
+                             "V4l2Source: YUYV input size calculation overflow");
+    }
+    const size_t requiredBytes = rowsBeforeLast * bytesperline_ + rowBytes;
+    if(bytesUsed < requiredBytes) {
+        return Status::error(Code::IoError,
+                             "V4l2Source: captured YUYV frame is too short: bytesused=" +
+                                 std::to_string(bytesUsed) + ", required=" +
+                                 std::to_string(requiredBytes));
+    }
+
+    const uint8_t* srcData[4] = {
+        static_cast<const uint8_t*>(data), nullptr, nullptr, nullptr
+    };
+    const int srcStride[4] = {
+        static_cast<int>(bytesperline_), 0, 0, 0
+    };
+    uint8_t* dstData[4] = {
+        out.y(), out.u(), out.v(), nullptr
+    };
+    const int dstStride[4] = {
+        out.yStride(), out.uvStride(), out.uvStride(), 0
+    };
+
+    const int outputRows = sws_scale(sws_,
+                                     srcData,
+                                     srcStride,
+                                     0,
+                                     actualCfg_.height,
+                                     dstData,
+                                     dstStride);
+    if(outputRows != actualCfg_.height) {
+        return Status::error(Code::Internal,
+                             "V4l2Source: sws_scale produced " +
+                                 std::to_string(outputRows) + " rows; expected " +
+                                 std::to_string(actualCfg_.height));
+    }
+
+    return Status::ok();
 }
 
 int V4l2Source::xioctl(int fd, unsigned long request, void* arg) {
