@@ -24,7 +24,7 @@ lowlat_stream/
 ├── modules/
 │   ├── capture/    ISource.h  NullSource.*  V4l2Source.*
 │   ├── encode/     Encoder.*                      # libavcodec/x264 封装
-│   ├── transport/  Packetizer.*  Fec.*  Nack.*  JitterBuffer.*  UdpSocket.*
+│   ├── transport/  Packet.*  Packetizer.*  Fec.*  Nack.*  JitterBuffer.*  UdpSocket.*
 │   ├── decode/     Decoder.*
 │   ├── render/     SdlRenderer.*
 │   └── server/     Room.*  Forwarder.*  Signaling.*
@@ -40,11 +40,16 @@ lowlat_stream/
 class ISource {
 public:
     virtual ~ISource() = default;
-    virtual bool open(const SourceConfig&) = 0;
-    virtual bool readFrame(RawFrame& out) = 0;   // 阻塞取一帧
+    virtual Status open(const SourceConfig&) = 0;
+    virtual const SourceConfig& actualConfig() const = 0;  // 驱动协商后的实际值
+    virtual Status readFrame(RawFrame& out) = 0;           // 阻塞取一帧
     virtual void close() = 0;
 };
 ```
+
+`open()` 收到的是**期望值不是承诺值**：摄像头驱动可以只给相近的分辨率和帧率。
+调用方必须在 open 成功后读 `actualConfig()`，据此打开下游（编码器按请求值打开、
+实际喂进不同尺寸的帧，得到的不是报错而是花屏）。
 
 ```cpp
 // 有界队列 —— 各线程之间唯一的解耦手段（阶段4支柱的工程化版本）
