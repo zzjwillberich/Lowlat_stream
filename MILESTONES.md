@@ -24,7 +24,7 @@
 **目标**：把画面变成 H.264 码流。
 
 - **Null 模拟源**：生成可辨识的测试画面（色块 + 帧号），无摄像头也能跑 ← **先做这个**
-- **V4L2 真摄像头**采集（VirtualBox + USB 直通验证）
+- **V4L2 采集**（v4l2loopback 虚拟设备验证，见 [NOTES 第 17 条](docs/NOTES.md)）
 - 编码：libavcodec/x264，低延迟参数（`zerolatency` / `-bf 0` / 短 GOP）
 - 采集与编码之间用有界队列解耦
 

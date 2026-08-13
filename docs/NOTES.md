@@ -406,3 +406,65 @@ return drainPackets(out);
   一直接收到 `AVERROR_EOF`，此时正常流程不应再返回 `EAGAIN`。
 - 不要用 `avcodec_flush_buffers()` 替代。前者的目标是**取完剩余输出**，后者是**重置内部状态**，
   可能直接丢掉尚未输出的数据。
+
+---
+
+### 17. 摄像头挂不进开发环境，最后改用 v4l2loopback 造虚拟设备
+
+**现象**
+V4L2 采集代码写完、契约测试全绿，但真机验证跑不起来 —— 开发环境里根本没有 `/dev/video0`。
+为了给它变出一个摄像头，连试三条路，全废：
+
+| 尝试 | 结果 | 原因 |
+|---|---|---|
+| WSL2 直通笔记本摄像头 | `/dev/video*` 不存在 | WSL2 默认内核没编 `CONFIG_VIDEO_DEV`，**没有 V4L2 子系统**。就算用 `usbipd-win` 把 USB 设备转进去，也没有驱动去认领它 |
+| VMware 虚拟机 + USB 直通 | `lsusb` 里始终看不到设备 | 笔记本内置摄像头虽然走 USB 协议，但被主机固件/系统握得很紧，VMware 抢不过来 |
+| `apt install v4l2loopback-dkms` | dkms 编译失败 | 发行版打包的是 0.12.7，比内核老 |
+
+第三条的报错值得单独记，因为它和前两条不是一类问题：
+
+```
+v4l2loopback.c:2089:9: error: too few arguments to function 'v4l2_fh_add'
+  2089 |   v4l2_fh_add(&opener->fh);
+/usr/src/linux-headers-.../include/media/v4l2-fh.h:97:6: note: declared here
+    97 | void v4l2_fh_add(struct v4l2_fh *fh, struct file *filp);
+```
+
+**原因**
+内核给 `v4l2_fh_add` / `v4l2_fh_del` 加了 `struct file *filp` 参数，而发行版仓库里的
+v4l2loopback 版本早于这次改动。**内核模块没有稳定 ABI，也不承诺 API 兼容** —— 树外模块
+（out-of-tree module）必须跟着内核版本走，发行版打包滞后半个版本就编不过。这类报错
+和自己的代码无关，看 `note: declared here` 指向的内核头文件就能确认是签名对不上。
+
+**做法**
+拿上游源码编，两行改动补上新参数：
+
+```bash
+git clone https://github.com/umlaeute/v4l2loopback.git
+cd v4l2loopback && make && sudo make install && sudo depmod -a
+sudo modprobe v4l2loopback video_nr=0 exclusive_caps=1
+```
+
+然后用 ffmpeg 往这个虚拟设备里持续推固定图案，`/dev/video0` 就是一个标准 V4L2 采集设备，
+`V4l2Source` 一行不用改：
+
+```bash
+ffmpeg -re -f lavfi -i testsrc=size=640x480:rate=30 -pix_fmt yuyv422 -f v4l2 /dev/video0
+```
+
+**为什么这不是"退而求其次"**
+一开始把 v4l2loopback 当成没有摄像头时的替代品，跑通之后发现它在两件事上**强于真摄像头**：
+
+- **可重复**。`testsrc` 每次输出的图案完全一致。调 `convertFrame()` 时颜色偏了、U/V 平面接反了、
+  stride 算错了，一眼就能看出来；真摄像头对着房间拍，画面每次都不同，**没有参照物**，
+  只能靠"看着好像不太对"来判断。
+- **可回归**。虚拟设备可以在任意机器上按需创建，V4L2 这条路径因此能进 CI、能参与压测。
+  真摄像头做不到 —— 它不能被脚本创建，也没法保证两次运行输入相同。
+
+这和 `NullSource` 的存在理由是同一条：**可重复的输入是调试和压测的前提**。区别只在于
+`NullSource` 绕过了整个 V4L2 子系统，而 v4l2loopback 保留了完整的
+`ioctl` / `mmap` / `QBUF` / `DQBUF` 调用链，验证的是真实的内核交互路径。
+
+> 更一般的教训：**先问"我到底要验证什么"，再决定环境怎么搭**。这里要验证的是
+> "V4L2 协议交互写对了没有"，不是"这个摄像头能不能用"。一开始盯着"把物理摄像头挂进来"，
+> 是把手段当成了目的，白花了一下午在 USB 直通上。
