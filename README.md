@@ -24,27 +24,35 @@ C++17 · CMake · GoogleTest · Linux(WSL2)
 | 里程碑 | 内容 | 状态 |
 |---|---|---|
 | **M0** | 工程骨架：CMake / 日志 / 配置 / 状态码 / 有界队列 / 单测 | ✅ 完成（tag `m0-skeleton`） |
-| M1 | 采集 + 编码（Null 模拟源 → H.264） | ⬜ |
+| **M1** | 采集 + 编码：Null 源 / V4L2 源 → 两线程管线 → H.264 | ✅ 完成（tag `m1-capture-encode`） |
 | M2 | UDP 传输（分片 / 组包 / 丢包乱序统计） | ⬜ |
 | M3 | 接收端解码渲染，端到端出画面 | ⬜ |
 | M4 | 弱网对抗：NACK / FEC / jitter buffer / PLI ⭐ | ⬜ |
 | M5 | 分发服务端：房间 + 一推多拉 + 背压 ⭐ | ⬜ |
 | M6 | Redis 指标 + HTTP API + 压测报告 | ⬜ |
 
-> M0 只搭地基，**不含任何业务逻辑**。三个可执行目前是空壳：解析参数、打一条日志、退出。
-> 量化指标（延迟 p50/p95/p99、丢包下表现、单机路数）和演示截图会在 M3/M4/M6 补上。
+> M1 打通了「采集 → 有界队列 → 编码 → 落盘」，但**还没有网络**：`lowlat_receiver` 和
+> `lowlat_server` 仍是空壳。量化指标（延迟 p50/p95/p99、丢包下表现、单机路数）和演示截图
+> 会在 M3/M4/M6 补上。
 
 ---
 
 ## 构建与运行
 
-依赖：CMake ≥ 3.16、支持 C++17 的编译器、pthread。GoogleTest 由 CMake `FetchContent` 自动拉取（首次构建需要联网）。
+依赖：CMake ≥ 3.16、支持 C++17 的编译器、pthread，以及 FFmpeg 开发包（编码与色彩转换）。
+GoogleTest 由 CMake `FetchContent` 自动拉取（首次构建需要联网）。
 
 ```bash
+sudo apt install -y build-essential cmake pkg-config \
+     libavcodec-dev libavutil-dev libswscale-dev
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
 ctest --test-dir build --output-on-failure
 ```
+
+`pkg_check_modules` 查的是 pkg-config 的 `.pc` 文件，只有 `-dev` 包才带；装完若仍报
+`Package 'libswscale' not found`，删掉 `build/` 重新 configure —— 查找失败的结果会进
+`CMakeCache.txt`，不删缓存会一直沿用旧结论。
 
 三个可执行：
 
@@ -66,6 +74,51 @@ ctest --test-dir build --output-on-failure
 
 `--key=value` 和 `--key value` 两种写法都支持；优先级 **命令行 > 配置文件 > 默认值**；
 未知参数**报错退出**，不静默忽略。
+
+### sender 参数（M1）
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--source <kind>` | `null` | `null` 合成画面源 / `v4l2` 摄像头源 |
+| `--device <path>` | `/dev/video0` | V4L2 设备节点，仅 `--source=v4l2` 使用 |
+| `--width` `--height` `--fps` | `640` `480` `30` | 期望采集参数，**驱动可能给出不同的值** |
+| `--bitrate <kbps>` | `2000` | 编码码率 |
+| `--gop <n>` | 同 `--fps` | 关键帧间隔（**单位是帧**，不是秒） |
+| `--cap <n>` | `4` | 采集→编码队列容量 |
+| `--frames <n>` | `100` | 采集帧数上限；`0` 表示一直跑到 Ctrl-C |
+| `--dump <file>` | — | 落 H.264 Annex B 裸流 |
+| `--dump-raw <file>` | — | 落编码前的 YUV420P 原始帧 |
+
+分辨率和帧率是**期望值不是承诺值**：摄像头驱动可以只给相近的值，实际协商结果会打一条
+INFO，编码器按**实际值**打开。
+
+### 跑一遍 M1
+
+```bash
+# 合成画面源：无需任何硬件
+./build/app/sender/lowlat_sender --source=null --frames=300 --dump=out_null.h264
+ffplay out_null.h264          # 能看到色块和递增的帧号
+```
+
+V4L2 这条路用 **v4l2loopback 虚拟设备**验证，不依赖物理摄像头（原因见
+[NOTES 第 17 条](docs/NOTES.md)）：
+
+```bash
+sudo apt install -y v4l2loopback-dkms v4l-utils ffmpeg
+sudo modprobe v4l2loopback video_nr=0 exclusive_caps=1
+
+# 另开一个终端挂着，持续往虚拟设备推固定测试图案
+ffmpeg -re -f lavfi -i testsrc=size=640x480:rate=30 -pix_fmt yuyv422 -f v4l2 /dev/video0
+
+./build/app/sender/lowlat_sender --source=v4l2 --frames=300 --dump=out_v4l2.h264
+ffplay out_v4l2.h264
+```
+
+真设备冒烟测试默认跳过，指定设备后才会运行：
+
+```bash
+LOWLAT_V4L2_DEVICE=/dev/video0 ctest --test-dir build --output-on-failure
+```
 
 日志输出到 stderr，格式固定（M6 要靠脚本解析它算指标）：
 
@@ -107,6 +160,15 @@ NACK 兜住 FEC 恢复不了的（省带宽），实在救不回来再 PLI 请�
 **为什么不用 MySQL** —— 实时流不落库。指标是高频写、短时效、要 TTL 自动过期的数据，
 没有持久化和关联查询场景，硬塞关系库属于设计冗余，用 Redis。
 
+**为什么采集源要抽象成接口** —— 唯一的理由是**可重复的输入**。`NullSource` 生成合成画面，
+不碰内核；V4L2 源配 v4l2loopback 虚拟设备，保留完整的 `ioctl` / `mmap` / `QBUF` 调用链。
+两级都能按需创建、每次输出一致——调试色彩转换时颜色偏没偏一眼可见，压测时两次运行的输入
+完全相同。真摄像头两条都做不到（画面不可重复、不能被脚本创建），所以它从来不是这里的目标。
+
+**为什么编码器按协商后的参数打开** —— 摄像头驱动可以不理会请求的分辨率，只给相近的值。
+按 640x480 开的编码器喂进 320x240 的帧，出来的不是报错而是**花屏**——最难查的一类问题。
+所以 source open 成功后必须读 `actualConfig()` 覆盖编码器配置，再打开编码器。
+
 **为什么不跨模块抛异常** —— 公开接口一律返回 `Status`（错误码 + 消息）。`Status` 标了
 `[[nodiscard]]`，忽略返回值直接编译告警——这是相对裸 `bool` 的主要收益。
 `Status` 本身**不打日志**：一次错误沿调用栈返回会被拷贝多次，且底层并不知道调用方
@@ -124,11 +186,20 @@ NACK 兜住 FEC 恢复不了的（省带宽），实在救不回来再 PLI 请�
 真要跨机器测端到端延迟时，改用 NTP 对齐后的 `system_clock`，或像 RTP 那样用 **RTT/2** 估算单向延迟。
 触发条件：M3 之后把 sender/receiver 部署到两台机器上。
 
+**GOP 单位是帧，帧率被驱动改了它就不等价** —— `--gop` 默认取 `--fps`，意思是"每秒一个 IDR"。
+但驱动只给 15fps 时 gop 仍是 30，就变成"每两秒一个 IDR"——起播时间和花屏恢复时间直接翻倍。
+是否按实际帧率缩放 gop 是个有取舍的决定（IDR 越密越抗丢包，也越费码率），
+留到 M3 量到起播延迟、有数据支撑时再定。触发条件：M3 能测出起播延迟之后。
+
+**V4L2 只支持 YUYV** —— 驱动最终协商出别的格式（常见的是 MJPEG）时直接返回 `IoError`，
+不按 YUYV 强行解释后输出花屏。要支持 MJPEG 得在采集侧接一次解码，
+触发条件：碰到只出 MJPEG 的设备且确实需要用它。
+
 ---
 
-## M0 踩坑记录
+## 踩坑记录
 
-完整版见 [docs/NOTES.md](docs/NOTES.md)，这里挑几个典型的。
+完整版见 [docs/NOTES.md](docs/NOTES.md)（17 条），这里挑几个典型的。
 
 ### 1. 头文件里在类外定义函数，必须加 `inline`
 
@@ -164,9 +235,35 @@ push 立即拒收，pop 要**先把残留取完**再返回 false，判断条件�
 两层保险：用例内 `std::async` + `future.wait_for(timeout)`；CMake 侧
 `gtest_discover_tests(... PROPERTIES TIMEOUT 30)`，让挂死表现为"这条用例失败"而不是"流水线卡住"。
 
+### 6. 周期性任务不要用相对睡眠
+
+`sleep_for(33ms)` 睡的是"这一觉"，不含醒来后干活的时间，误差**每帧都在累加**且只增不减。
+30fps 每帧多花 1ms，10 秒后就慢了 0.3 帧。而速率失配会一路变成延迟：
+**采集比下游快 → 队列积压 → 积压就是延迟**，且不会自己消掉。
+改用 `sleep_until(起点 + n × 周期)`，误差不累积。更阴的一条：`captureMs` 是端到端延迟的
+**起点**，采集节奏漂了这个时间戳就偏，M3 算出的分位数本身就不准——**测量工具自己先漂了**。
+
+### 7. 编码结束前必须发送空帧排空编码器
+
+所有帧都 `send_frame` 完了，直接关编码器，输出**少了最后几帧**。编码器为了帧间预测和码率
+分析会内部暂存若干帧，"目前没有继续送"不等于"以后不会再送"，它不能自己决定收尾。
+`avcodec_send_frame(ctx, nullptr)` 里的 `nullptr` **不是黑帧**，是 EOF 信号，
+之后要一直 `receive_packet` 到 `AVERROR_EOF`。别用 `avcodec_flush_buffers()` 替代——
+那是**重置状态**，会把还没输出的包直接丢掉。
+
+### 8. 为什么用虚拟摄像头而不是真摄像头
+
+给 V4L2 找一个能跑的设备，连试三条路全废：WSL2 默认内核**没编 V4L2 子系统**；
+VMware 抢不到笔记本内置摄像头；发行版的 `v4l2loopback-dkms` 比内核老、编不过
+（内核给 `v4l2_fh_add` 加了参数——树外模块必须跟内核版本走）。最后用上游源码编 v4l2loopback
+造虚拟设备，跑通后发现它**强于**真摄像头：`testsrc` 图案固定，调色彩转换时颜色偏了、
+U/V 平面接反了一眼可见，真摄像头对着房间拍没有参照物；且虚拟设备可按需创建，
+V4L2 路径因此能进 CI 和压测。教训是**先问要验证什么，再决定环境怎么搭**——
+这里要验证的是"V4L2 协议交互写对没有"，不是"这个摄像头能不能用"。
+
 其余若干条（条件变量 `wait` 必须带谓词、先解锁再 notify、`std::mutex` 不可重入、
-`size()` 返回即过期、按值传参的 `push` 失败时实参已被掏空、clangd 编译数据库过期……）
-都在 [docs/NOTES.md](docs/NOTES.md) 里。
+`size()` 返回即过期、按值传参的 `push` 失败时实参已被掏空、只 `= delete` 拷贝会把移动
+一起弄没、clangd 编译数据库过期……）都在 [docs/NOTES.md](docs/NOTES.md) 里。
 
 ---
 
