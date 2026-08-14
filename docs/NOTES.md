@@ -468,3 +468,50 @@ ffmpeg -re -f lavfi -i testsrc=size=640x480:rate=30 -pix_fmt yuyv422 -f v4l2 /de
 > 更一般的教训：**先问"我到底要验证什么"，再决定环境怎么搭**。这里要验证的是
 > "V4L2 协议交互写对了没有"，不是"这个摄像头能不能用"。一开始盯着"把物理摄像头挂进来"，
 > 是把手段当成了目的，白花了一下午在 USB 直通上。
+
+---
+
+## M2 · 自研传输
+
+### 18. 协议头不能把整个结构体 `memcpy` 上网
+
+**现象**
+发送端和接收端使用同一份 `PacketHeader` 定义，本机自测可能正常；一旦更换编译器、调整字段顺序，
+或与不同字节序的机器通信，接收端就会读出错误的 `streamId`、巨大 `seq` 等异常值。
+线上协议明明规定包头是 12 字节，`sizeof(PacketHeader)` 也可能不是 12。
+
+**原因**
+`PacketHeader` 是 C++ 对象的**内存表示**，不是协议的**线上表示**，两者受不同规则约束：
+
+- 编译器可能为满足字段对齐，在结构体成员之间或末尾插入填充字节；因此 `sizeof` 不保证等于各字段
+  线上长度之和，填充字节也不属于协议。
+- 多字节整数在内存中使用本机字节序；协议规定统一使用网络字节序（大端）。在常见的小端机器上，
+  `0x12345678` 的内存顺序是 `78 56 34 12`，直接复制会把顺序发反。
+- `#pragma pack(1)` 最多只能去掉填充，解决不了字节序问题，还会让内存布局依赖编译器扩展。
+
+因此下面这种写法不可靠：
+
+```cpp
+std::memcpy(buf, &header, sizeof(header));  // 错：复制的是本机对象表示
+```
+
+**做法**
+把线上布局当成协议契约，按规定偏移逐字段写入：`version` 写 `buf[0]`，`type` 写 `buf[1]`，
+`streamId` 转为网络序后写 `buf[2..3]`，`seq` 写 `buf[4..7]`，`timestampMs` 写
+`buf[8..11]`。解码时按相同偏移反向读取并转回本机字节序。
+
+```cpp
+buf[0] = header.version;
+buf[1] = static_cast<uint8_t>(header.type);
+
+const uint16_t streamId = htons(header.streamId);
+const uint32_t seq = htonl(header.seq);
+const uint32_t timestampMs = htonl(header.timestampMs);
+std::memcpy(buf + 2, &streamId, sizeof(streamId));
+std::memcpy(buf + 4, &seq, sizeof(seq));
+std::memcpy(buf + 8, &timestampMs, sizeof(timestampMs));
+```
+
+这里禁止的是**一次复制整个结构体**；单个字段先完成字节序转换，再用 `memcpy` 写入固定偏移是安全的，
+并且不会产生未对齐指针解引用的问题。`PACKET_HEADER_SIZE` 必须是协议明确规定的 12，不能写成
+`sizeof(PacketHeader)`。

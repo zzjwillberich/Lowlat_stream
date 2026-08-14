@@ -1,71 +1,139 @@
 /**
  * @file    Packet.cpp
- * @brief   Packet.h 的实现骨架
+ * @brief   Packet.h 的实现
  * @author  zzj
  * @date    2026-08-13
  */
 
 #include "modules/transport/Packet.h"
 
-Status encodePacketHeader(const PacketHeader& header, uint8_t* buf, size_t bufLen) {
-    (void)header;
-    (void)buf;
-    (void)bufLen;
+#include <arpa/inet.h>
+#include <cstring>
 
-    // TODO(M2):
-    // 1. 校验 buf 非空、bufLen >= PACKET_HEADER_SIZE、version == PROTOCOL_VERSION。
-    // 2. 按固定偏移逐字段写: [0]version [1]type [2..3]streamId
-    //    [4..7]seq [8..11]timestampMs, 多字节字段一律网络字节序。
-    // 3. 不要 memcpy 整个结构体 —— 对齐填充和本机字节序都会让线上布局出错。
-    return Status::error(Code::Internal, "encodePacketHeader is not implemented (M2)");
+Status encodePacketHeader(const PacketHeader& header, uint8_t* buf, size_t bufLen) {
+    if (buf == nullptr) {
+        return Status::error(Code::InvalidArg, "encodePacketHeader: buf must not be null");
+    }
+    if (bufLen < PACKET_HEADER_SIZE) {
+        return Status::error(Code::InvalidArg,
+                             "encodePacketHeader: buffer is smaller than PACKET_HEADER_SIZE");
+    }
+    if (header.version != PROTOCOL_VERSION) {
+        return Status::error(Code::InvalidArg,
+                             "encodePacketHeader: version does not match PROTOCOL_VERSION");
+    }
+
+    buf[0] = header.version;
+    buf[1] = static_cast<uint8_t>(header.type);
+
+    const uint16_t streamIdNet = htons(header.streamId);
+    const uint32_t seqNet = htonl(header.seq);
+    const uint32_t timestampNet = htonl(header.timestampMs);
+
+    std::memcpy(buf + 2, &streamIdNet, sizeof(streamIdNet));
+    std::memcpy(buf + 4, &seqNet, sizeof(seqNet));
+    std::memcpy(buf + 8, &timestampNet, sizeof(timestampNet));
+    return Status::ok();
 }
 
 Status decodePacketHeader(const uint8_t* buf, size_t bufLen, PacketHeader& out) {
-    (void)buf;
-    (void)bufLen;
-    (void)out;
+    if (buf == nullptr) {
+        return Status::error(Code::InvalidArg, "decodePacketHeader: buf must not be null");
+    }
+    if (bufLen < PACKET_HEADER_SIZE) {
+        return Status::error(Code::InvalidArg,
+                             "decodePacketHeader: buffer is smaller than PACKET_HEADER_SIZE");
+    }
+    if (buf[0] != PROTOCOL_VERSION) {
+        return Status::error(Code::NetError, "decodePacketHeader: unsupported protocol version");
+    }
+    if (buf[1] < static_cast<uint8_t>(PacketType::Data) ||
+        buf[1] > static_cast<uint8_t>(PacketType::Stats)) {
+        return Status::error(Code::NetError, "decodePacketHeader: unknown packet type");
+    }
 
-    // TODO(M2):
-    // 1. 校验 buf 非空、bufLen >= PACKET_HEADER_SIZE, 否则 InvalidArg。
-    // 2. 按与 encode 相同的偏移读回, 网络序转本机序。
-    // 3. version 不等于 PROTOCOL_VERSION、或 type 不在 1..6 内, 返回 NetError:
-    //    这是对端/网络的问题, 调用方应当丢包计数而不是修参数重试。
-    // 4. 校验全部通过后才写 out, 不要边解析边填 —— 失败时留下半个结构体, 调用方
-    //    如果忽略了返回值就会拿它去组包。
-    return Status::error(Code::Internal, "decodePacketHeader is not implemented (M2)");
+    uint16_t streamIdNet;
+    uint32_t seqNet;
+    uint32_t timestampNet;
+    std::memcpy(&streamIdNet, buf + 2, sizeof(streamIdNet));
+    std::memcpy(&seqNet, buf + 4, sizeof(seqNet));
+    std::memcpy(&timestampNet, buf + 8, sizeof(timestampNet));
+
+    PacketHeader decoded;
+    decoded.version = buf[0];
+    decoded.type = static_cast<PacketType>(buf[1]);
+    decoded.streamId = ntohs(streamIdNet);
+    decoded.seq = ntohl(seqNet);
+    decoded.timestampMs = ntohl(timestampNet);
+    out = decoded;
+
+    return Status::ok();
 }
 
 Status encodeDataHeader(const DataHeader& header, uint8_t* buf, size_t bufLen) {
-    (void)header;
-    (void)buf;
-    (void)bufLen;
+    if (buf == nullptr) {
+        return Status::error(Code::InvalidArg, "encodeDataHeader: buf must not be null");
+    }
+    if (bufLen < DATA_HEADER_SIZE) {
+        return Status::error(Code::InvalidArg,
+                             "encodeDataHeader: buffer is smaller than DATA_HEADER_SIZE");
+    }
+    if (header.fragCount == 0) {
+        return Status::error(Code::InvalidArg, "encodeDataHeader: fragCount must be at least 1");
+    }
+    if (header.fragIndex >= header.fragCount) {
+        return Status::error(Code::InvalidArg,
+                             "encodeDataHeader: fragIndex must be smaller than fragCount");
+    }
 
-    // TODO(M2):
-    // 1. 校验 buf 非空、bufLen >= DATA_HEADER_SIZE。
-    // 2. 校验 fragCount >= 1 且 fragIndex < fragCount, 否则 InvalidArg ——
-    //    这是本端 packetizer 的 bug, 不该让畸形包上网。
-    // 3. 偏移: [0..3]frameId [4..5]fragIndex [6..7]fragCount [8]flags。
-    return Status::error(Code::Internal, "encodeDataHeader is not implemented (M2)");
+    const uint32_t frameIdNet = htonl(header.frameId);
+    const uint16_t fragIndexNet = htons(header.fragIndex);
+    const uint16_t fragCountNet = htons(header.fragCount);
+
+    std::memcpy(buf, &frameIdNet, sizeof(frameIdNet));
+    std::memcpy(buf + 4, &fragIndexNet, sizeof(fragIndexNet));
+    std::memcpy(buf + 6, &fragCountNet, sizeof(fragCountNet));
+    buf[8] = header.flags;
+
+    return Status::ok();
 }
 
 Status decodeDataHeader(const uint8_t* buf, size_t bufLen, DataHeader& out) {
-    (void)buf;
-    (void)bufLen;
-    (void)out;
+    if (buf == nullptr) {
+        return Status::error(Code::InvalidArg, "decodeDataHeader: buf must not be null");
+    }
+    if (bufLen < DATA_HEADER_SIZE) {
+        return Status::error(Code::InvalidArg,
+                             "decodeDataHeader: buffer is smaller than DATA_HEADER_SIZE");
+    }
 
-    // TODO(M2):
-    // 1. 校验 buf 非空、bufLen >= DATA_HEADER_SIZE, 否则 InvalidArg。
-    // 2. 读回四个字段。
-    // 3. fragCount == 0 或 fragIndex >= fragCount 返回 NetError ——
-    //    组包器信任这两个字段去索引数组, 必须在入口挡住。
-    return Status::error(Code::Internal, "decodeDataHeader is not implemented (M2)");
+    uint32_t frameIdNet;
+    uint16_t fragIndexNet;
+    uint16_t fragCountNet;
+    std::memcpy(&frameIdNet, buf, sizeof(frameIdNet));
+    std::memcpy(&fragIndexNet, buf + 4, sizeof(fragIndexNet));
+    std::memcpy(&fragCountNet, buf + 6, sizeof(fragCountNet));
+
+    const uint16_t fragIndex = ntohs(fragIndexNet);
+    const uint16_t fragCount = ntohs(fragCountNet);
+    if (fragCount == 0) {
+        return Status::error(Code::NetError, "decodeDataHeader: received fragCount is zero");
+    }
+    if (fragIndex >= fragCount) {
+        return Status::error(Code::NetError,
+                             "decodeDataHeader: received fragIndex is outside fragCount");
+    }
+
+    DataHeader decoded;
+    decoded.frameId = ntohl(frameIdNet);
+    decoded.fragIndex = fragIndex;
+    decoded.fragCount = fragCount;
+    decoded.flags = buf[8];
+    out = decoded;
+
+    return Status::ok();
 }
 
 bool seqNewerThan(uint32_t a, uint32_t b) {
-    (void)a;
-    (void)b;
-
-    // TODO(M2): return static_cast<int32_t>(a - b) > 0;
-    //           无符号相减本身就是模 2^32 运算, 回绕后差值仍然正确。
-    return false;
+    return static_cast<int32_t>(a - b) > 0;
 }
