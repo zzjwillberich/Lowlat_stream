@@ -10,6 +10,18 @@
 #include <arpa/inet.h>
 #include <cstring>
 
+namespace {
+    /**
+     * 类型合法性只在这一处判定: 编解码两边各写一份, 加了新类型迟早漏改一边。
+     *
+     * @note 依赖 PacketType 取值连续 —— 新增类型必须接在 Stats 之后, 否则中间的空洞会被放行。
+     */
+    bool isKnownPacketType(uint8_t type) {
+        return type >= static_cast<uint8_t>(PacketType::Data) &&
+               type <= static_cast<uint8_t>(PacketType::Stats);
+    }
+}  // namespace
+
 Status encodePacketHeader(const PacketHeader& header, uint8_t* buf, size_t bufLen) {
     if (buf == nullptr) {
         return Status::error(Code::InvalidArg, "encodePacketHeader: buf must not be null");
@@ -21,6 +33,10 @@ Status encodePacketHeader(const PacketHeader& header, uint8_t* buf, size_t bufLe
     if (header.version != PROTOCOL_VERSION) {
         return Status::error(Code::InvalidArg,
                              "encodePacketHeader: version does not match PROTOCOL_VERSION");
+    }
+    if (!isKnownPacketType(static_cast<uint8_t>(header.type))) {
+        return Status::error(Code::InvalidArg,
+                             "encodePacketHeader: type is outside the defined range");
     }
 
     buf[0] = header.version;
@@ -47,8 +63,7 @@ Status decodePacketHeader(const uint8_t* buf, size_t bufLen, PacketHeader& out) 
     if (buf[0] != PROTOCOL_VERSION) {
         return Status::error(Code::NetError, "decodePacketHeader: unsupported protocol version");
     }
-    if (buf[1] < static_cast<uint8_t>(PacketType::Data) ||
-        buf[1] > static_cast<uint8_t>(PacketType::Stats)) {
+    if (!isKnownPacketType(buf[1])) {
         return Status::error(Code::NetError, "decodePacketHeader: unknown packet type");
     }
 

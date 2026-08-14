@@ -118,10 +118,14 @@ constexpr size_t MAX_DATA_PACKET_SIZE = PACKET_HEADER_SIZE + DATA_HEADER_SIZE + 
  * @param bufLen 缓冲区可写字节数
  *
  * @return Ok         写入 PACKET_HEADER_SIZE 字节
- *  InvalidArg buf 为空, 或 bufLen 不足, 或 version 不是 PROTOCOL_VERSION
+ *  InvalidArg buf 为空, bufLen 不足, version 不是 PROTOCOL_VERSION,
+ *                     或 type 不在已定义取值内
  *
  * @note 逐字段按固定偏移写, 不做 `memcpy(buf, &header, sizeof header)` ——
  *          结构体有对齐填充, sizeof 不等于线上长度, 且本机可能是小端。
+ * @note type 在**编码时**就查, 而不是留给对端的 decode 去判 NetError:
+ *          否则本端一行赋值写错, 现象是"对端一直丢包", 排查方向指向网络,
+ *          bug 却在发送端。编码器的价值就是把错误挡在离 bug 最近的地方。
  */
 Status encodePacketHeader(const PacketHeader& header, uint8_t* buf, size_t bufLen);
 

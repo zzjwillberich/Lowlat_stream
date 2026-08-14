@@ -223,6 +223,19 @@ TEST(PacketHeader, DecodeRejectsUnknownTypeAsNetError) {
     }
 }
 
+TEST(PacketHeader, EncodeRejectsUndefinedTypeAsInvalidArg) {
+    std::vector<uint8_t> buf(PACKET_HEADER_SIZE, 0);
+
+    for (uint8_t bad : {0, 7, 200, 255}) {
+        PacketHeader h = sampleHeader();
+        h.type = static_cast<PacketType>(bad);
+        // 与上一条对照: 同样是"类型不认识", 编码端是 InvalidArg(本端传错了参数),
+        // 解码端是 NetError(对端发来的包有问题)。包还没上网, 不该报成网络错误。
+        EXPECT_EQ(encodePacketHeader(h, buf.data(), buf.size()).code(), Code::InvalidArg)
+            << "type=" << int(bad) << " 不在协议定义内, 不能编码出去";
+    }
+}
+
 TEST(DataHeader, EncodeRejectsInconsistentFragmentation) {
     std::vector<uint8_t> buf(DATA_HEADER_SIZE, 0);
 
