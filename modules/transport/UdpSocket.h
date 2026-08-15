@@ -69,11 +69,15 @@ public:
      *
      * @return Ok       套接字可用
      *  InvalidArg 已经打开过(不允许覆盖 fd, 那会泄漏)
-     *  NetError   socket() 或 fcntl() 失败
+     *  NetError   socket() 失败
      *
      * @note 设为非阻塞不是为了轮询, 而是为了兜住一个陷阱: poll 报告可读之后,
      *          recvfrom **仍可能阻塞**(例如该数据报校验和错误被内核丢弃)。
      *          阻塞式 socket 在这种情况下会把收包线程永久卡住。
+     * @note 用 socket() 的 SOCK_NONBLOCK|SOCK_CLOEXEC 一次建好, 不走事后 fcntl:
+     *          分两步中间有窗口, 而且 CLOEXEC 一旦漏设, fork/exec 出去的子进程会
+     *          继承这个 fd —— 端口在本进程 close 之后仍被占着, 现象是重启服务报
+     *          "Address already in use", 查半天查不到是谁占的。
      */
     Status open();
 
