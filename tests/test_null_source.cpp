@@ -200,11 +200,15 @@ TEST(NullSource, RespectsFrameRate) {
     constexpr int FPS = 50;   // 20ms 一帧
     constexpr int N   = 5;
 
+    // 计时起点必须在 open() **之前**: NullSource 的节流基准是 open() 里记的时刻,
+    // 第 n 帧等到"基准 + n/fps"。把 t0 放在 open() 之后, 测到的时长就少了
+    // open() 到 t0 之间那一段, 机器一忙(比如 ctest 并行跑)这段被拉长, 用例就假红。
+    const auto t0 = std::chrono::steady_clock::now();
+
     NullSource src;
     ASSERT_TRUE(src.open(cfg(64, 32, FPS)).isOk());
 
     RawFrame f;
-    const auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < N; ++i) {
         ASSERT_TRUE(src.readFrame(f).isOk());
     }
