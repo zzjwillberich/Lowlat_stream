@@ -11,7 +11,6 @@
 #include <vector>
 
 #include "common/Status.h"
-#include "modules/transport/Packet.h"
 
 /** @brief 一个拼好的完整数据包(通用头 + DATA 头 + 载荷), 可直接交给 UdpSocket::sendTo */
 using PacketBuffer = std::vector<uint8_t>;
