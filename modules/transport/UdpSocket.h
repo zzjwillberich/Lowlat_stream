@@ -30,6 +30,22 @@ struct Endpoint {
 };
 
 /**
+ * @brief 解析 "ip:port" 形式的命令行参数
+ *
+ * @param text "127.0.0.1:9000"; 冒号前允许为空, 表示所有网卡
+ * @param out  出参, 解析成功时被填充
+ *
+ * @return Ok         解析成功
+ *  InvalidArg 没有冒号、端口为空/非数字/超出 1..65535, 或 ip 不是合法 IPv4
+ *
+ * @note 放在这里而不是各自的 main 里: sender 的 --target 和 receiver 的 --listen
+ *          是同一件事, 抄两份迟早在一边修了边界、另一边没修。
+ * @note 端口 0 在这里**拒绝**: bind(0) 让内核分配是代码里的用法, 命令行上写 0
+ *          几乎一定是参数没填对, 让它在启动时炸掉比跑起来之后每个包都失败强。
+ */
+Status parseEndpoint(const std::string& text, Endpoint& out);
+
+/**
  * UDP 套接字的 RAII 封装。
  *
  * 发送端: `open()` 后直接 `sendTo()`, 内核自动分配源端口。

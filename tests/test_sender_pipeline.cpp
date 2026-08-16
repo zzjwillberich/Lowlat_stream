@@ -110,6 +110,25 @@ TEST(SenderPipeline, RejectsInvalidQueueCapacity) {
     EXPECT_EQ(pipeline.run(stop).code(), Code::InvalidArg);
 }
 
+TEST(SenderPipeline, RejectsAnIncompleteSendTarget) {
+    {
+        SenderPipelineConfig cfg = pipelineConfig();
+        cfg.target = Endpoint{"127.0.0.1", 0};  // 端口没填
+        SenderPipeline pipeline(std::make_unique<NullSource>(), cfg);
+        const std::atomic<bool> stop{false};
+        // 让它在启动时炸掉, 而不是跑起来之后每个包都失败
+        EXPECT_EQ(pipeline.run(stop).code(), Code::InvalidArg);
+    }
+    {
+        SenderPipelineConfig cfg = pipelineConfig();
+        cfg.target = Endpoint{"127.0.0.1", 9000};
+        cfg.sendQueueCapacity = 0;  // 同 queueCapacity, 负数/0 会变成巨大容量
+        SenderPipeline pipeline(std::make_unique<NullSource>(), cfg);
+        const std::atomic<bool> stop{false};
+        EXPECT_EQ(pipeline.run(stop).code(), Code::InvalidArg);
+    }
+}
+
 TEST(SenderPipeline, CapturesEncodesAndDrainsEveryFrame) {
     constexpr int FRAMES = 30;
     TempOutputs output("drain");

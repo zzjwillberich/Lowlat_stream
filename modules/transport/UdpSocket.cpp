@@ -27,6 +27,22 @@ std::string Endpoint::toString() const {
     return (ip.empty() ? "*" : ip) + ":" + std::to_string(port);
 }
 
+Status parseEndpoint(const std::string& text, Endpoint& out) {
+    // TODO(M2): 步骤:
+    //  1. 找**最后一个**冒号(rfind(':')), 没有 → InvalidArg;
+    //     用 rfind 而不是 find, 以后加 IPv6 时 "::1:9000" 才不会在第一个冒号上切断;
+    //  2. 端口部分为空 → InvalidArg; 逐字符检查是不是数字 —— 别直接上 std::stoi:
+    //     它会把 "9000abc" 解析成 9000, 参数写错了反而静默跑起来;
+    //  3. 数值转换后检查 1 <= port <= 65535(0 也拒, 见头文件说明);
+    //  4. ip 部分非空时校验能被 inet_pton 解析, 不合法 → InvalidArg。
+    //     在这里就挡住, 而不是等到 bind/sendTo 才报 —— 参数错误应当在启动时暴露,
+    //     那时用户还盯着终端;
+    //  5. 全部通过才写 out, 失败路径不碰它。
+    (void)text;
+    (void)out;
+    return Status::error(Code::Internal, "parseEndpoint is not implemented (M2)");
+}
+
 UdpSocket::~UdpSocket() {
     close();
 }

@@ -251,6 +251,33 @@ TEST(UdpSocket, ZeroTimeoutReturnsImmediately) {
 
 // ---------- 端点 ----------
 
+TEST(Endpoint, ParsesHostPortFromTheCommandLine) {
+    Endpoint ep;
+    ASSERT_TRUE(parseEndpoint("127.0.0.1:9000", ep).isOk());
+    EXPECT_EQ(ep.ip, "127.0.0.1");
+    EXPECT_EQ(ep.port, 9000u);
+
+    ASSERT_TRUE(parseEndpoint(":9000", ep).isOk()) << "冒号前为空表示所有网卡";
+    EXPECT_TRUE(ep.ip.empty());
+    EXPECT_EQ(ep.port, 9000u);
+}
+
+TEST(Endpoint, RejectsMalformedHostPort) {
+    Endpoint ep;
+    for (const char* bad : {
+             "",                  // 空串
+             "127.0.0.1",         // 没有端口
+             "127.0.0.1:",        // 端口为空
+             "127.0.0.1:0",       // 命令行上写 0 几乎一定是参数没填对
+             "127.0.0.1:70000",   // 超出 uint16_t —— 截断的话会静默连到 4464 端口
+             "127.0.0.1:9000abc", // std::stoi 会把它当 9000, 参数写错了却静默跑起来
+             "127.0.0.1:-1",
+             "not-an-ip:9000",
+         }) {
+        EXPECT_EQ(parseEndpoint(bad, ep).code(), Code::InvalidArg) << "input=" << bad;
+    }
+}
+
 TEST(UdpSocket, EndpointToStringIsLogFriendly) {
     Endpoint ep{LOOPBACK, 9000};
     EXPECT_EQ(ep.toString(), "127.0.0.1:9000");
