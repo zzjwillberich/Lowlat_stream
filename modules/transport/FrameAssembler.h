@@ -196,6 +196,9 @@ private:
     /** @brief 更新 baseSeq/highestSeq; highestSeq 的比较必须用 seqNewerThan */
     void trackSeq(uint32_t seq);
 
+    /** @brief 返回当前最老的 frameId; 调用前保证 pending_ 非空 */
+    uint32_t oldestPendingFrameId() const;
+
     /**
      * @brief 淘汰最老的一条, 并把水位推到它那里
      *

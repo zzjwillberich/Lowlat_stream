@@ -256,6 +256,25 @@ TEST(FrameAssembler, EvictsOldestPendingFrameWhenCapacityIsExceeded) {
     EXPECT_EQ(fa.stats().framesDropped, 1u) << "被放弃的是最老的帧 1";
 }
 
+TEST(FrameAssembler, AnArrivalOlderThanEverythingPendingDoesNotEvictAnyone) {
+    FrameAssembler fa(2);
+    ASSERT_TRUE(offerPacket(fa, makePacket(0, 5, 0, 2, fakePayload(100, 0))).isOk());
+    ASSERT_TRUE(offerPacket(fa, makePacket(1, 6, 0, 2, fakePayload(100, 1))).isOk());
+
+    // 帧 3 落后了整个窗口(M4 的重传会真的造出这种包)。它的其余分片只会更晚,
+    // 收齐无望。让它挤掉帧 5 是双输: 帧 5 本来还有希望, 帧 3 进来也补不齐 ——
+    // 因为淘汰帧 5 会把水位推到 5, 反过来挡住帧 3 自己剩下的分片
+    ASSERT_TRUE(offerPacket(fa, makePacket(2, 3, 0, 2, fakePayload(100, 2))).isOk());
+    EXPECT_EQ(fa.stats().packetsTooLate, 1u);
+    EXPECT_EQ(fa.stats().framesDropped, 0u) << "不该为了一个收不齐的帧丢掉还有希望的帧";
+
+    // 帧 5 补齐后必须还能交付
+    ASSERT_TRUE(offerPacket(fa, makePacket(3, 5, 1, 2, fakePayload(100, 3))).isOk());
+    AssembledFrame frame;
+    ASSERT_TRUE(fa.pop(frame));
+    EXPECT_EQ(frame.frameId, 5u);
+}
+
 TEST(FrameAssembler, EvictedFrameIsNotResurrectedByALateFragment) {
     FrameAssembler fa(2);
     ASSERT_TRUE(offerPacket(fa, makePacket(0, 1, 0, 2, fakePayload(100))).isOk());
