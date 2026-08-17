@@ -28,19 +28,49 @@ std::string Endpoint::toString() const {
 }
 
 Status parseEndpoint(const std::string& text, Endpoint& out) {
-    // TODO(M2): 步骤:
-    //  1. 找**最后一个**冒号(rfind(':')), 没有 → InvalidArg;
-    //     用 rfind 而不是 find, 以后加 IPv6 时 "::1:9000" 才不会在第一个冒号上切断;
-    //  2. 端口部分为空 → InvalidArg; 逐字符检查是不是数字 —— 别直接上 std::stoi:
-    //     它会把 "9000abc" 解析成 9000, 参数写错了反而静默跑起来;
-    //  3. 数值转换后检查 1 <= port <= 65535(0 也拒, 见头文件说明);
-    //  4. ip 部分非空时校验能被 inet_pton 解析, 不合法 → InvalidArg。
-    //     在这里就挡住, 而不是等到 bind/sendTo 才报 —— 参数错误应当在启动时暴露,
-    //     那时用户还盯着终端;
-    //  5. 全部通过才写 out, 失败路径不碰它。
-    (void)text;
-    (void)out;
-    return Status::error(Code::Internal, "parseEndpoint is not implemented (M2)");
+    const size_t colon = text.rfind(':');
+    if (colon == std::string::npos) {
+        return Status::error(Code::InvalidArg,
+                             "parseEndpoint: endpoint must have the form ip:port");
+    }
+
+    const std::string ip = text.substr(0, colon);
+    const std::string portText = text.substr(colon + 1);
+    if (portText.empty()) {
+        return Status::error(Code::InvalidArg, "parseEndpoint: port must not be empty");
+    }
+
+    uint32_t port = 0;
+    for (const char ch : portText) {
+        if (ch < '0' || ch > '9') {
+            return Status::error(Code::InvalidArg,
+                                 "parseEndpoint: port must contain only decimal digits");
+        }
+
+        port = port * 10 + static_cast<uint32_t>(ch - '0');
+        if (port > 65535) {
+            return Status::error(Code::InvalidArg,
+                                 "parseEndpoint: port must be in the range 1..65535");
+        }
+    }
+    if (port == 0) {
+        return Status::error(Code::InvalidArg,
+                             "parseEndpoint: port must be in the range 1..65535");
+    }
+
+    if (!ip.empty()) {
+        in_addr parsedAddress{};
+        if (::inet_pton(AF_INET, ip.c_str(), &parsedAddress) != 1) {
+            return Status::error(Code::InvalidArg,
+                                 "parseEndpoint: invalid IPv4 address: " + ip);
+        }
+    }
+
+    Endpoint parsed;
+    parsed.ip = ip;
+    parsed.port = static_cast<uint16_t>(port);
+    out = std::move(parsed);
+    return Status::ok();
 }
 
 UdpSocket::~UdpSocket() {

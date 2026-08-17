@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <csignal>
+#include <string>
 #include <utility>
 
 #include "app/sender/SenderPipeline.h"
@@ -24,8 +25,9 @@ namespace {
         }
     }
 
-    SenderPipelineConfig makePipelineConfig(const Config& config) {
+    SenderPipelineConfig makePipelineConfig(const Config& config, bool& ok) {
         SenderPipelineConfig pipeline;
+        ok = true;
 
         pipeline.source.width  = config.getInt("width", 640);
         pipeline.source.height = config.getInt("height", 480);
@@ -39,9 +41,20 @@ namespace {
         pipeline.encoder.gop         = config.getInt("gop", pipeline.source.fps);
 
         pipeline.queueCapacity = config.getInt("cap", 4);
+        pipeline.sendQueueCapacity = config.getInt("send-cap", 4);
         pipeline.maxFrames     = config.getInt("frames", 100);
         pipeline.rawDumpPath   = config.get("dump-raw");
         pipeline.h264DumpPath  = config.get("dump");
+
+        const std::string target = config.get("target", "127.0.0.1:9000");
+        if (!target.empty()) {
+            const Status status = parseEndpoint(target, pipeline.target);
+            if (!status.isOk()) {
+                LOG_ERROR("sender", "invalid --target '%s': %s", target.c_str(),
+                          status.toString().c_str());
+                ok = false;
+            }
+        }
         return pipeline;
     }
 }  // namespace
@@ -52,13 +65,17 @@ int main(int argc, char** argv) {
 
     Logger::instance().setLevel(parseLogLevel(config.get("log-level", "info")));
 
+    bool configOk = false;
+    SenderPipelineConfig pipelineConfig = makePipelineConfig(config, configOk);
+    if (!configOk) return 1;
+
     auto source = createSource(config.get("source", "null"));
     if (!source) return 1;  // 工厂已经记录具体错误
 
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
 
-    SenderPipeline pipeline(std::move(source), makePipelineConfig(config));
+    SenderPipeline pipeline(std::move(source), std::move(pipelineConfig));
     const Status status = pipeline.run(gStopRequested);
     if (!status.isOk()) {
         LOG_ERROR("sender", "pipeline failed: %s", status.toString().c_str());
@@ -67,11 +84,15 @@ int main(int argc, char** argv) {
 
     const SenderPipelineStats& stats = pipeline.stats();
     LOG_INFO("sender",
-             "stopped: captured=%llu encoded=%llu bytes=%llu key=%llu queue_peak=%zu elapsed=%llums",
+             "stopped: captured=%llu encoded=%llu bytes=%llu key=%llu "
+             "queue_peak=%zu send_queue_peak=%zu packets_sent=%llu send_errors=%llu "
+             "elapsed=%llums",
              static_cast<unsigned long long>(stats.capturedFrames),
              static_cast<unsigned long long>(stats.encodedFrames),
              static_cast<unsigned long long>(stats.encodedBytes),
              static_cast<unsigned long long>(stats.keyFrames), stats.queuePeak,
+             stats.sendQueuePeak, static_cast<unsigned long long>(stats.packetsSent),
+             static_cast<unsigned long long>(stats.sendErrors),
              static_cast<unsigned long long>(stats.elapsedMs));
     return 0;
 }

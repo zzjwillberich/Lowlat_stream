@@ -7,6 +7,8 @@
 
 #include <atomic>
 #include <csignal>
+#include <string>
+#include <utility>
 
 #include "app/receiver/ReceiverPipeline.h"
 #include "common/Config.h"
@@ -23,16 +25,25 @@ namespace {
         }
     }
 
-    // TODO(M2): 照着 sender 的 makePipelineConfig 写:
-    //  ReceiverPipelineConfig makeReceiverConfig(const Config& config, bool& ok);
-    //  - listen        ← parseEndpoint(config.get("listen", "0.0.0.0:9000"))
-    //                    解析失败要让 main 返回 1, 别退回默认端口后安静跑起来 ——
-    //                    用户明明写了 --listen 却在别的端口上监听, 等他发现已经浪费半天
-    //                    (同 createSource 对未知 source 的处理);
-    //  - h264DumpPath  ← config.get("dump")
-    //  - maxFrames     ← config.getInt("frames", 0)
-    //  - idleTimeoutMs ← config.getInt("idle-timeout", 0)
-    //  - recvTimeoutMs ← config.getInt("recv-timeout", 200)
+    ReceiverPipelineConfig makeReceiverConfig(const Config& config, bool& ok) {
+        ReceiverPipelineConfig pipeline;
+        ok = true;
+
+        const std::string listen = config.get("listen", "0.0.0.0:9000");
+        const Status status = parseEndpoint(listen, pipeline.listen);
+        if (!status.isOk()) {
+            LOG_ERROR("receiver", "invalid --listen '%s': %s", listen.c_str(),
+                      status.toString().c_str());
+            ok = false;
+            return pipeline;
+        }
+
+        pipeline.h264DumpPath = config.get("dump");
+        pipeline.maxFrames = config.getInt("frames", 0);
+        pipeline.idleTimeoutMs = config.getInt("idle-timeout", 0);
+        pipeline.recvTimeoutMs = config.getInt("recv-timeout", 200);
+        return pipeline;
+    }
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -43,22 +54,42 @@ int main(int argc, char** argv) {
 
     Logger::instance().setLevel(parseLogLevel(config.get("log-level", "info")));
 
+    bool configOk = false;
+    ReceiverPipelineConfig pipelineConfig = makeReceiverConfig(config, configOk);
+    if (!configOk) return 1;
+
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
 
-    // TODO(M2): 装配并运行:
-    //  1. 构造 ReceiverPipelineConfig(解析失败 return 1);
-    //  2. ReceiverPipeline pipeline(cfg);
-    //  3. pipeline.open() 失败 → LOG_ERROR + return 1;
-    //  4. open() 成功后打一条 "listening on port %u" —— 用 boundPort() 而不是配置里的值,
-    //     bind(0) 时那才是真正在听的端口;
-    //  5. pipeline.run(gStopRequested);
-    //  6. 收尾打统计: framesWritten / bytesWritten / keyFrames /
-    //     assembler.packetsReceived / packetsLost() / packetsMalformed / framesDropped。
-    //     丢包和畸形包要**分开打**, 混在一起就分不出该修网络还是该修对端。
-    LOG_INFO("receiver", "receiver starting");
-    LOG_DEBUG("receiver", "log-level=%s listen=%s",
-              config.get("log-level", "info").c_str(),
-              config.get("listen", "0.0.0.0:9000").c_str());
+    ReceiverPipeline pipeline(std::move(pipelineConfig));
+    Status status = pipeline.open();
+    if (!status.isOk()) {
+        LOG_ERROR("receiver", "open failed: %s", status.toString().c_str());
+        return 1;
+    }
+
+    LOG_INFO("receiver", "listening on port %u",
+             static_cast<unsigned>(pipeline.boundPort()));
+
+    status = pipeline.run(gStopRequested);
+
+    const ReceiverPipelineStats& stats = pipeline.stats();
+    LOG_INFO("receiver",
+             "stopped: frames=%llu bytes=%llu key=%llu packets=%llu lost=%llu "
+             "malformed=%llu dropped=%llu recv_errors=%llu elapsed=%llums",
+             static_cast<unsigned long long>(stats.framesWritten),
+             static_cast<unsigned long long>(stats.bytesWritten),
+             static_cast<unsigned long long>(stats.keyFrames),
+             static_cast<unsigned long long>(stats.assembler.packetsReceived),
+             static_cast<unsigned long long>(stats.assembler.packetsLost()),
+             static_cast<unsigned long long>(stats.assembler.packetsMalformed),
+             static_cast<unsigned long long>(stats.assembler.framesDropped),
+             static_cast<unsigned long long>(stats.recvErrors),
+             static_cast<unsigned long long>(stats.elapsedMs));
+
+    if (!status.isOk()) {
+        LOG_ERROR("receiver", "pipeline failed: %s", status.toString().c_str());
+        return 1;
+    }
     return 0;
 }

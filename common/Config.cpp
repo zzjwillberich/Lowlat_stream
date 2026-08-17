@@ -26,7 +26,9 @@ namespace {
             || key == "source" || key == "device" || key == "width" || key == "height"
             || key == "fps" || key == "frames" || key == "dump-raw"
             // M1 编码参数
-            || key == "dump" || key == "bitrate" || key == "gop" || key == "cap";
+            || key == "dump" || key == "bitrate" || key == "gop" || key == "cap"
+            // M2 传输参数
+            || key == "send-cap" || key == "recv-timeout" || key == "idle-timeout";
     }
 }
 
@@ -195,12 +197,16 @@ void Config::printUsage() const {
         "  --width <n>           Frame width, must be even (default: 640)\n"
         "  --height <n>          Frame height, must be even (default: 480)\n"
         "  --fps <n>             Capture frame rate (default: 30)\n"
-        "  --frames <n>          Stop after N frames (default: 100)\n"
+        "  --frames <n>          Stop after N frames (sender: 100, receiver: unlimited)\n"
         "  --dump-raw <file>     Write raw YUV420P frames to file\n"
         "Encode (sender):\n"
         "  --dump <file>         Encode to H.264 Annex B and write to file\n"
         "  --bitrate <kbps>      Target bitrate in kbps (default: 2000)\n"
         "  --gop <n>             Key frame interval in frames (default: fps)\n"
         "  --cap <n>             Raw frame queue capacity (default: 4)\n"
+        "Transport:\n"
+        "  --send-cap <n>        Encoded frame queue capacity (default: 4)\n"
+        "  --recv-timeout <ms>   Receiver poll timeout (default: 200)\n"
+        "  --idle-timeout <ms>   Receiver idle timeout; 0 disables (default: 0)\n"
     );
 }

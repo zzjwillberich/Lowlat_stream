@@ -14,7 +14,6 @@
 #include "modules/encode/Encoder.h"
 
 #include <cstdint>
-#include <fcntl.h>
 #include <memory>
 #include <thread>
 #include <utility>
@@ -32,10 +31,11 @@ Status SenderPipeline::run(const std::atomic<bool>& stopRequested) {
 
     queue_ = std::make_unique<BoundedQueue<std::unique_ptr<RawFrame>>>(config_.queueCapacity);
 
-    // TODO(M2): target.ip 非空时创建发送队列:
-    //  sendQueue_ = std::make_unique<BoundedQueue<std::unique_ptr<EncodedFrame>>>(
-    //      config_.sendQueueCapacity);
-    //  为空时保持 nullptr —— encodeLoop 靠它判断这一级存不存在, 行为与 M1 完全一致。
+    if (!config_.target.ip.empty()) {
+        sendQueue_ =
+            std::make_unique<BoundedQueue<std::unique_ptr<EncodedFrame>>>(
+                config_.sendQueueCapacity);
+    }
 
     status =  openResources();
     if(!status.isOk()) return status;
@@ -48,22 +48,28 @@ Status SenderPipeline::run(const std::atomic<bool>& stopRequested) {
         encodeLoop();
     });
 
-    // TODO(M2): sendQueue_ 非空时再起一个 std::thread 跑 sendLoop(), 并在 encode.join()
-    //  之后 join 它。顺序不能反: encodeLoop 退出时才会 close(sendQueue_),
-    //  先 join 发送线程会等一个还没被关的队列, 直接死锁。
+    std::thread send;
+    if (sendQueue_) {
+        send = std::thread([this]() { sendLoop(); });
+    }
 
     capture.join();
     encode.join();
+    if (send.joinable()) {
+        send.join();
+    }
 
     stats_.queuePeak = queue_->peak();
-    // TODO(M2): sendQueue_ 非空时 stats_.sendQueuePeak = sendQueue_->peak();
+    if (sendQueue_) {
+        stats_.sendQueuePeak = sendQueue_->peak();
+    }
     uint64_t end = steadyNowMs();
     stats_.elapsedMs = end - start;
     closeResources();
 
     if(!captureStatus_.isOk()) return captureStatus_;
     if(!encodeStatus_.isOk()) return encodeStatus_;
-    // TODO(M2): if(!sendStatus_.isOk()) return sendStatus_;
+    if(!sendStatus_.isOk()) return sendStatus_;
     return Status::ok();
 }
 
@@ -84,10 +90,16 @@ Status SenderPipeline::validateConfig() const {
                              "SenderPipeline: max frames must be non-negative");
     }
 
-    // TODO(M2): target.ip 非空时校验:
-    //  - config_.sendQueueCapacity <= 0 → InvalidArg(同 queueCapacity, 负数会变成巨大容量);
-    //  - config_.target.port == 0 → InvalidArg(0 号端口发不出去, 而且是个典型的
-    //    "参数没填"信号 —— 让它在启动时炸掉, 而不是跑起来之后每个包都失败)。
+    if (!config_.target.ip.empty()) {
+        if (config_.sendQueueCapacity <= 0) {
+            return Status::error(Code::InvalidArg,
+                                 "SenderPipeline: send queue capacity must be positive");
+        }
+        if (config_.target.port == 0) {
+            return Status::error(Code::InvalidArg,
+                                 "SenderPipeline: target port must be positive");
+        }
+    }
 
     const SourceConfig& sourceConfig = config_.source;
     if (sourceConfig.width <= 0 || sourceConfig.height <= 0 ||
@@ -157,9 +169,13 @@ Status SenderPipeline::openResources() {
         return st;
     }
 
-    // TODO(M2): target.ip 非空时 socket_.open(), 失败照样要 closeResources() 再返回。
-    //  不需要 bind: 发送端的源端口由内核在首次 sendTo 时分配。
-    //  M4 要收 NACK/PLI 时才需要一个固定端口 —— 那时再加, 现在加是猜需求。
+    if (!config_.target.ip.empty()) {
+        st = socket_.open();
+        if (!st.isOk()) {
+            closeResources();
+            return st;
+        }
+    }
 
     if(!config_.rawDumpPath.empty()){
         rawFile_.open(config_.rawDumpPath,std::ios::binary | std::ios::trunc);
@@ -205,6 +221,7 @@ void SenderPipeline::captureLoop(const std::atomic<bool>& stopRequested) {
 
 void SenderPipeline::encodeLoop() {
     encodeStatus_ = Status::ok();
+    bool sendQueueClosed = false;
 
     std::vector<EncodedFrame> out;
     while(true){
@@ -232,51 +249,73 @@ void SenderPipeline::encodeLoop() {
             encodeStatus_ = writeEncodedFrame(it);
             if(!encodeStatus_.isOk()) break;
             stats_.encodedFrames++;
-            // TODO(M2): sendQueue_ 非空时把这一帧移进发送队列:
-            //  sendQueue_->push(std::make_unique<EncodedFrame>(std::move(it)));
-            //  **必须在 writeEncodedFrame 之后**: 移动过后 it.data 就是空的了,
-            //  反过来写 dump 会写出 0 字节, 而且只在开了发送时才复现。
-            //  push 返回 false 表示队列已关闭, 按 break 处理。
+            if (sendQueue_ &&
+                !sendQueue_->push(std::make_unique<EncodedFrame>(std::move(it)))) {
+                sendQueueClosed = true;
+                break;
+            }
         }
-        if(!encodeStatus_.isOk()) break;
+        if(!encodeStatus_.isOk() || sendQueueClosed) break;
 
         out.clear();
     }
 
-    if(encodeStatus_.isOk()){
+    if(encodeStatus_.isOk() && !sendQueueClosed){
         encodeStatus_ = encoder_.flush(out);
         if(encodeStatus_.isOk()) {       
             for(auto& it : out){
                 encodeStatus_ = writeEncodedFrame(it);
                 if(!encodeStatus_.isOk()) break;
                 stats_.encodedFrames++;
+                if (sendQueue_ &&
+                    !sendQueue_->push(std::make_unique<EncodedFrame>(std::move(it)))) {
+                    sendQueueClosed = true;
+                    break;
+                }
             }
         }
     }
 
-    if(!encodeStatus_.isOk()) abortRequested_.store(true);
+    if(!encodeStatus_.isOk() || sendQueueClosed) abortRequested_.store(true);
     queue_->close();
-    // TODO(M2): sendQueue_ 非空时 sendQueue_->close();
-    //  漏了这行, 发送线程会永远阻塞在 pop() 上, run() 的 join 再也回不来 ——
-    //  现象是"跑完最后一帧程序不退出", 而且 Ctrl-C 也没用(停止标志只管采集线程)。
-    //  flush 出来的帧也要先入队再关, 顺序反了会丢掉编码器缓冲里的最后几帧。
+    if (sendQueue_) {
+        sendQueue_->close();
+    }
 }
 
 void SenderPipeline::sendLoop() {
-    // TODO(M2): 步骤:
-    //  1. sendStatus_ = Status::ok();
-    //  2. while (sendQueue_->pop(frame)) {
-    //       - 构造 EncodedFrameView: data/len 指向 frame->data, frameId/captureMs/isKey 透传;
-    //       - packetizer_.packetize(view, packets_) —— packets_ 是成员, 跨帧复用;
-    //         失败(空帧等)记 sendStatus_ 并 break, 那是本端 bug 不是网络问题;
-    //       - 逐包 socket_.sendTo(config_.target, pkt.data(), pkt.size()):
-    //           成功 → ++stats_.packetsSent;
-    //           失败 → ++stats_.sendErrors, **继续发下一个**, 不中断管线。
-    //     }
-    //
-    //  为什么单包失败不算错误: UDP 上丢包是常态, 一个 sendto 返回 -1 (缓冲区满、
-    //  ICMP 不可达) 不代表管线该停。socket 真坏了的话每个包都会失败, sendErrors
-    //  的数量会明白地告诉你 —— 让计数说话, 不要让第一个错误就把整条流掐掉。
+    sendStatus_ = Status::ok();
+
+    std::unique_ptr<EncodedFrame> frame;
+    while (sendQueue_->pop(frame)) {
+        EncodedFrameView view;
+        view.data = frame->data.data();
+        view.len = frame->data.size();
+        view.frameId = frame->frameId;
+        view.captureMs = frame->captureMs;
+        view.isKey = frame->isKey;
+
+        sendStatus_ = packetizer_.packetize(view, packets_);
+        if (!sendStatus_.isOk()) {
+            break;
+        }
+
+        for (const PacketBuffer& packet : packets_) {
+            const Status status =
+                socket_.sendTo(config_.target, packet.data(), packet.size());
+            if (status.isOk()) {
+                ++stats_.packetsSent;
+            } else {
+                ++stats_.sendErrors;
+            }
+        }
+    }
+
+    if (!sendStatus_.isOk()) {
+        abortRequested_.store(true);
+        sendQueue_->close();
+        queue_->close();
+    }
 }
 
 Status SenderPipeline::writeEncodedFrame(const EncodedFrame& frame) {
