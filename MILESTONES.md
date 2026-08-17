@@ -38,12 +38,16 @@
 **目标**：码流能过网络送到对端并完整还原。
 
 - 自研协议包头（见 PROTOCOL）：全局 `seq` + `frame_id/frag_index/frag_count`
-- 发送端：分片 + `sendmsg`/`iovec` 零拷贝
-- 接收端：按 `frame_id` 重组、按 `seq` 检丢包/乱序
-- 统计：收发包数、还原帧数、丢包数、乱序数
+- 发送端：`UdpSocket`（RAII）+ `Packetizer` 分片，编码与发送之间再加一级有界队列
+- 接收端：`FrameAssembler` 按 `frame_id` 重组、按 `seq` 统计丢包/乱序
+- 统计：收发包数、还原帧数、丢包数、畸形包数、放弃的残帧数
 
-**交付物**：`lowlat_sender` → `lowlat_receiver --dump=recv.h264`
+**交付物**：`lowlat_sender --target=…` → `lowlat_receiver --dump=recv.h264`
 **验收**：无丢包时 `recv.h264` 与发送端 dump **逐字节一致**；统计数字对得上。
+
+> `sendmsg`/`iovec` 零拷贝**没做**：现在是把包头和载荷拼进一块连续缓冲再 `sendto`。
+> 省掉的那次 memcpy 是 1200 字节 × 每秒几十次，还没有证据说它值得，
+> 留到 M6 压测时按火焰图决定（见 README「已知限制」）。
 
 ---
 
