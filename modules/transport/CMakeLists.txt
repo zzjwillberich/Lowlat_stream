@@ -1,5 +1,6 @@
 add_library(lltransport STATIC
     FrameAssembler.cpp
+    JitterBuffer.cpp
     Packet.cpp
     Packetizer.cpp
     UdpSocket.cpp
