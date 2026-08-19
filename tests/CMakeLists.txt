@@ -28,6 +28,7 @@ add_unit_test(test_frame)                      # 帧类型与采集接口契约
 add_unit_test(test_null_source llcapture)      # 合成画面源
 add_unit_test(test_v4l2_source llcapture)      # V4L2 无硬件契约 + 可选真机冒烟
 add_unit_test(test_encoder llencode)           # H.264 编码器
+add_unit_test(test_decoder lldecode llencode llcapture)   # M3.2 H.264 解码
 add_unit_test(test_packet lltransport)         # 协议包头编解码
 add_unit_test(test_udp_socket lltransport)     # UDP 收发(回环)
 add_unit_test(test_packetizer lltransport)     # 帧分片打包
