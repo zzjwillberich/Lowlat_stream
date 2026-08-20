@@ -264,11 +264,11 @@ TEST(Decoder, DecodedFrameIsNotFlat) {
     const std::vector<RawFrame> got = decodeClip(dec, clip);
     ASSERT_FALSE(got.empty());
 
-    // 光比均值不够: 一片纯灰的画面均值也可能"恰好对"。NullSource 画的是渐变 + 帧号,
-    // 左右两半的亮度必然有差别
-    const double left = meanOf(got[0].data.data(), W, 0, 0, W / 2, H);
-    const double right = meanOf(got[0].data.data(), W, W / 2, 0, W / 2, H);
-    EXPECT_GT(std::abs(left - right), 3.0) << "解出来的画面是平的, 多半根本没解出内容";
+    // 不能比较左右半幅的均值: 条纹周期是 219, 320 宽画面各取 160 像素时会恰好
+    // 接近抵消。取两个不跨周期的局部区域，纯灰画面必然失败，正常渐变则有明显差异。
+    const double near = meanOf(got[0].data.data(), W, 16, 96, 32, 32);
+    const double far = meanOf(got[0].data.data(), W, 80, 96, 32, 32);
+    EXPECT_GT(std::abs(near - far), 3.0) << "解出来的画面是平的, 多半根本没解出内容";
 }
 
 TEST(Decoder, ChromaPlanesAreNotSwapped) {
