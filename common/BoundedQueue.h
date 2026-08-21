@@ -7,6 +7,7 @@
 #pragma once
 
 #include <cassert>
+#include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
@@ -115,6 +116,45 @@ public:
         notEmpty_.wait(lk, [this]{ return !q_.empty() || closed_; });
 
         // 判空而不是判 closed_: 关闭后残留数据仍要让消费者取完, 否则 close 瞬间丢帧
+        if(q_.empty()) return false;
+
+        out = std::move(q_.front());
+        q_.pop_front();
+
+        lk.unlock();
+        notFull_.notify_one();
+        return true;
+    }
+
+    /**
+     * @brief 从队首取出一个元素, 队空时最多等 timeout 这么久
+     *
+     * @param out     出参, 成功时被 move 赋值为队首元素
+     * @param timeout 最长等待时间; 传 0 等价于"看一眼就走"
+     *
+     * @return true  取出成功
+     *  false 等到超时都没有数据, 或队列已 close 且已被取空
+     *
+     * @note **超时是"最多等多久"的上限, 不是"必须等多久"的下限**: 元素一进来,
+     *          push 里的 notify_one() 立刻把等待者叫醒, 所以对**数据**是零额外延迟。
+     *          超时值只决定"没数据时多久把控制权还给调用方"。
+     * @note 存在的理由是**一个线程要同时等两个事件源**: 渲染线程既要等解码出来的帧,
+     *          又要定期去泵 SDL 事件 —— 用阻塞版 pop() 会让事件泵停摆, 窗口点不掉、
+     *          标题栏变灰。超时值等于"事件响应的最大延迟", 几毫秒即可, 人眼无感。
+     *          见 NOTES.md D16。
+     * @note 返回 false **分不清是超时还是 close**, 这是刻意的: 为这个区分再加一个出参,
+     *          会让最常见的用法多一行噪音。调用方本来就在循环里, 下一轮自然会再问一次;
+     *          真要收尾, 查自己的退出标志比查队列状态更准。
+     */
+    bool popFor(T& out, std::chrono::milliseconds timeout){
+        std::unique_lock<std::mutex> lk(mu_);
+
+        // 带谓词的 wait_for 自己处理虚假唤醒, 也自己处理"进来时条件已经满足"
+        notEmpty_.wait_for(lk, timeout, [this]{ return !q_.empty() || closed_; });
+
+        // 判空而不是判 wait_for 的返回值: "超时"和"close 后已取空"对调用方是同一件事
+        // —— 没东西给你。而 close 后的残留数据仍要让消费者取完, 判 closed_ 会在这里
+        // 把它们丢掉(同 pop 的处理)
         if(q_.empty()) return false;
 
         out = std::move(q_.front());
