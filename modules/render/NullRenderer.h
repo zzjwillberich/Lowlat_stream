@@ -55,11 +55,14 @@ private:
      *
      * 查这几条:
      *   - captureMs 严格递增, **但 captureMs == 0 时跳过比较**
-     *   - frameId   严格递增, 允许跳号(丢帧就跳了), 不要求 +1
+     *   - frameId   严格递增, 允许跳号(丢帧就跳了)不要求 +1, **同样在 0 时跳过**
      *
-     * @note captureMs == 0 是哨兵不是时间: Decoder::drainFrames() 查不到 pending_
-     *          元信息时, 帧会带着 0 出去, 那正是 DecoderStats::framesMissingMeta
-     *          存在的原因(NOTES.md D14)。不跳过就会被自己的哨兵值误报。
+     * @note **0 是哨兵不是数据, 而且 captureMs 和 frameId 是同一个哨兵**:
+     *          Decoder::drainFrames() 查不到 pending_ 元信息时, 这两个字段会
+     *          一起留在默认值 0 出去 —— 那正是 DecoderStats::framesMissingMeta
+     *          存在的原因(NOTES.md D14)。两条都得跳过, 只跳一条等于没跳:
+     *          frameId 那条不豁免的话 `0 <= 任何已见过的 id` 恒真, 元信息一丢失
+     *          就被记成坏帧, 而且错误信息指向渲染器, 把人往反方向带。
      * @note **不查"宽高跨帧一致"** —— 那不是不变量。H.264 码流自带 SPS, 对端重开
      *          编码器时分辨率会变, 而那恰恰是渲染器该正确处理的场景, 不是错误。
      * @note frameId 不查回绕: RawFrame::frameId 是 uint64, 30fps 跑满 2^64 要约

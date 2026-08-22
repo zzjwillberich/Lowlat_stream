@@ -185,6 +185,14 @@ Status Decoder::drainFrames(std::vector<RawFrame>& out) {
             decoded.captureMs = pending->second.captureMs;
             decoded.frameId = pending->second.frameId;
             pending_.erase(pending_.begin(), std::next(pending));
+        } else {
+            // 查不到元信息也照样把帧交出去 —— 画面比时间戳重要。
+            // 但 captureMs 和 frameId 都会留在默认值 0, 下游拿到的是**两个哨兵**:
+            // 延迟统计要跳过它(否则 mean/max 被一个 0 直接毁掉),
+            // NullRenderer 的跨帧递增检查也要跳过它(否则会误报成坏帧, 而且
+            // 错误信息指向渲染器, 把人往反方向带)。
+            // 这个计数器是这条路唯一的信号, 稳态下应当恒为 0。
+            ++stats_.framesMissingMeta;
         }
 
         out.push_back(std::move(decoded));
