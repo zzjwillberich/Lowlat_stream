@@ -225,7 +225,11 @@ TEST(ReceiverPipeline, AFrameMissingAFragmentIsNeverWritten) {
 TEST(ReceiverPipeline, KeepsRunningAfterAGarbagePacket) {
     TempFile dump("garbage");
     ReceiverPipelineConfig cfg = receiverConfig(dump.path.string());
-    cfg.maxFrames = 1;
+    // 这里**不能**用 maxFrames 收尾。垃圾包和数据帧来自两个不同的 socket
+    // (sendFrame 自己开一个), 源端口不同就是两条流, 回环上到达顺序没有保证。
+    // maxFrames=1 会让接收端在写完帧的那一刻立刻退出, 约 1/4 的情况下垃圾包
+    // 还躺在内核缓冲里没被 recvFrom 取过 —— packetsMalformed 于是恒为 0。
+    // 用 idleTimeoutMs 收尾: 静默 500ms 才退, 保证收到的东西都被读干净了。
     ReceiverPipeline pipeline(cfg);
     ASSERT_TRUE(pipeline.open().isOk());
     const uint16_t port = pipeline.boundPort();
