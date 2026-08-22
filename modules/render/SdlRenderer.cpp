@@ -35,10 +35,16 @@ Status SdlRenderer::open(const RendererConfig& cfg) {
         return Status::error(Code::IoError, "SDL_CreateWindow failed: " + error);
     }
 
-    // 显式写 ACCELERATED: flags 传 0 表示"任何驱动都行", SDL 按驱动列表顺序挑第一个,
-    // 实践中软件渲染器排在最后所以通常也能选到加速驱动 —— 但那是靠列表顺序兜着的,
-    // 写出来才不怕将来顺序变。
-    Uint32 flags = SDL_RENDERER_ACCELERATED;
+    // flags 不写 SDL_RENDERER_ACCELERATED, 让 SDL 自己按驱动列表顺序挑 ——
+    // 实践中软件驱动排在最后, 有加速就会先选上。
+    //
+    // 之所以不显式要加速: 那样在无头环境(SDL_VIDEODRIVER=dummy)下 CreateRenderer
+    // 会直接失败 "Couldn't find matching render driver", 而无头是单测能跑到
+    // SdlRenderer 的唯一途径。ensureTexture 的重建逻辑、close 的销毁顺序、
+    // renderFrame 的整条路径 —— 这些才是这个类里真正有逻辑的部分, 显式要加速
+    // 就等于把它们全部划到测试覆盖之外。用"可能选到软件渲染器"换"这些代码
+    // 每次 ctest 都被跑一遍", 这笔交易划算。
+    Uint32 flags = 0;
     if (cfg.vsync) {
         flags |= SDL_RENDERER_PRESENTVSYNC;
     }

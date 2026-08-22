@@ -53,10 +53,16 @@ Status NullRenderer::renderFrame(const RawFrame& frame) {
     hasPrev_ = true;
     prevWidth_ = frame.width;
     prevHeight_ = frame.height;
+    // 两个哨兵字段的更新都要挡住 0, 否则基准会被哨兵帧冲掉:
+    // 一个 frameId == 0 的帧过去之后, prevFrameId_ 变成 0, 紧跟它的那一帧
+    // 就会因为 `prevFrameId_ != 0` 不成立而**整条递增检查被跳过** ——
+    // 哨兵帧本身要放行, 但不能顺手把下一帧的检查也一起放掉。
     if (frame.captureMs != 0) {
         prevCaptureMs_ = frame.captureMs;
     }
-    prevFrameId_ = frame.frameId;
+    if (frame.frameId != 0) {
+        prevFrameId_ = frame.frameId;
+    }
     ++stats_.framesRendered;
     return Status::ok();
 }
