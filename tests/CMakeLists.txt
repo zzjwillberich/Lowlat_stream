@@ -24,6 +24,7 @@ endfunction()
 add_unit_test(test_logger)          # 日志线程安全
 add_unit_test(test_config)          # 配置解析
 add_unit_test(test_bounded_queue)   # 有界队列
+add_unit_test(test_metrics)         # M3.4 延迟百分位统计
 add_unit_test(test_frame)                      # 帧类型与采集接口契约
 add_unit_test(test_null_source llcapture)      # 合成画面源
 add_unit_test(test_v4l2_source llcapture)      # V4L2 无硬件契约 + 可选真机冒烟
