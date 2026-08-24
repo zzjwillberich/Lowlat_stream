@@ -2,6 +2,7 @@ add_library(llcommon STATIC
     Logger.cpp
     Config.cpp
     Status.cpp
+    Metrics.cpp
 )
 
 target_include_directories(llcommon PUBLIC ${PROJECT_SOURCE_DIR})
