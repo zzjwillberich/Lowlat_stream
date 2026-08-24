@@ -12,8 +12,15 @@
 #include "common/Clock.h"
 #include "modules/transport/Packet.h"
 
+// 初始化顺序按**声明顺序**走, 不是初始化列表的书写顺序 —— 这里两者一致, 别调换。
+// queueA_/queueB_ 必须在这里初始化: BoundedQueue 只有 explicit BoundedQueue(size_t),
+// 没有默认构造。
 ReceiverPipeline::ReceiverPipeline(ReceiverPipelineConfig config)
-    : config_(std::move(config)), assembler_(config_.maxPendingFrames) {}
+    : config_(std::move(config)),
+      assembler_(config_.maxPendingFrames),
+      jitter_(config_.jitter),
+      queueA_(config_.decodeQueueCapacity),
+      queueB_(config_.renderQueueCapacity) {}
 
 Status ReceiverPipeline::open() {
     Status status = validateConfig();
