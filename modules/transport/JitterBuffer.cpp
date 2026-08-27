@@ -101,6 +101,15 @@ void JitterBuffer::reset() {
     stats_ = {};
 }
 
+void JitterBuffer::dropUntilKeyFrame() {
+    // 这是下游跟不上时的局部重启，不是重连：帧号扩展锚、时钟映射和已交付水位都
+    // 必须保留。清掉它们会让回绕后的新帧永久被判作过期，也会把抖动水位重新锚在
+    // 拥塞期间的慢样本上。
+    stats_.framesDroppedForResync += pending_.size();
+    pending_.clear();
+    started_ = !config_.startOnKeyFrame;
+}
+
 uint64_t JitterBuffer::extendFrameId(uint32_t frameId) {
     if (!hasRef_) {
         refFrameId_ = frameId;

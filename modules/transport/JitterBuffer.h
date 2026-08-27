@@ -77,6 +77,9 @@ struct JitterBufferStats {
     /** @brief 因超过 hardLimitFrames 被真正丢弃的帧数 */
     uint64_t framesDropped = 0;
 
+    /** @brief 队列 A 烧保险丝后清空 pending_ 并重新等关键帧时丢弃的帧数 */
+    uint64_t framesDroppedForResync = 0;
+
     /** @brief 起播前丢弃的非关键帧数 */
     uint64_t framesBeforeKey = 0;
 };

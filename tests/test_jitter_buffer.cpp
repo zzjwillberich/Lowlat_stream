@@ -99,6 +99,22 @@ TEST(JitterBuffer, KeyFrameGateCanBeDisabled) {
     EXPECT_EQ(jb.stats().framesBeforeKey, 0u);
 }
 
+TEST(JitterBuffer, DropUntilKeyFrameCountsPendingFramesAndRearmsTheGate) {
+    JitterBuffer jb;
+    jb.push(makeFrame(1, 1000, /*isKey=*/true), 1000);
+    jb.push(makeFrame(2, 1033, /*isKey=*/false), 1000);
+    ASSERT_EQ(jb.size(), 2u);
+
+    jb.dropUntilKeyFrame();
+    EXPECT_EQ(jb.size(), 0u);
+    EXPECT_EQ(jb.stats().framesDroppedForResync, 2u);
+
+    jb.push(makeFrame(3, 1066, /*isKey=*/false), 1000);
+    EXPECT_EQ(jb.stats().framesBeforeKey, 1u);
+    jb.push(makeFrame(4, 1099, /*isKey=*/true), 1000);
+    EXPECT_EQ(popId(jb, 9000), 4);
+}
+
 // ---------- 排序 ----------
 
 TEST(JitterBuffer, DeliversInFrameIdOrderRegardlessOfArrivalOrder) {
