@@ -1651,3 +1651,178 @@ if(closed_) return false;      // 唯一的 false 出口
 **和 [[D17]] 的关系**：同一条收尾路径上的两个坑，角度相反 ——
 D17 是线程**醒不过来**，D19 是线程醒过来之后**说错话**。
 
+
+## D20. 报出去的数字有三种撒谎方式：沉默的分母、名不副实的标签、含着测量工具自己的开销
+
+**症状**
+三线程管线跑起来了，每秒一行统计看着很体面：
+
+```text
+[INFO] fps=30 latency p50=8 p95=14 | queueA=0 queueB=1 | lost=0 assembler_lost=0
+```
+
+问题是 —— **重载到画面卡成幻灯片的时候，这一行几乎一模一样**。
+`lost` 还是 0，`p99` 还是那么漂亮。一个无法证伪的数字。
+
+**机制**：三种撒谎方式，都不是"算错了"，是"没说全"
+
+### 一、沉默的分母：被丢掉的东西不在任何数字里
+
+接收端有两条丢帧路径，当时**一条都没计数**：
+
+```cpp
+queueB_.forcePush(...)        // 泄压阀: 满了就 q_.pop_front(), 悄悄的
+queueA_.clear();              // 保险丝: 整段清掉
+jitter_.dropUntilKeyFrame();  // 并要求从下一个 IDR 重新起播
+```
+
+日志里报的 `lost` 是 `jitter.framesTooLate + framesDropped`，而 `framesDropped` 只在
+`JitterBuffer::enforceCapacity()`（硬上限）里 `++` —— **上面这两条路一条都不在里面。**
+
+于是就有了这个剧本：
+
+```text
+轻载:  30fps 全部显示,   p99=25ms  lost=0
+重载:  一半帧被悄悄扔了, p99=25ms  lost=0    <- 两行完全一样
+```
+
+> **延迟统计会自我美化 —— 越是扛不住，越只有"跑得快的帧"活下来被统计。**
+> 所以丢帧数不是"顺便报一下"，它是让 p99 这个数字**可信的前提**。
+
+还有一层：**两种丢弃的代价差一个数量级，不能混进同一个数字**。
+
+| | 代价 | 人眼 |
+|---|---|---|
+| 泄压阀丢一帧 | 33ms @30fps | 察觉不到 |
+| 保险丝烧一次 | 冻结到下一个 IDR，最长一个 GOP（1 秒） | 非常明显 |
+
+`dropped=100` 如果既可能是"丢了 100 个单帧"又可能是"烧了几次保险丝"，
+那它跟没报一样。**保险丝次数必须单独一个字段。**
+
+**做法**：分三层数，各数各的边界
+
+- `BoundedQueue::dropped()` —— 数容器**实际移除**的元素（`forcePush` 丢最老 + `clear` 整段），
+  和已有的 `peak()` 完全对称，都是"仅供观测"
+- 管线自己的 `decodeQueueRejected_` —— 数队列**数不到**的那一份：`tryPush()` 失败时
+  元素已经被 move 进 `unique_ptr` 了，队列根本没见过它
+- `JitterBufferStats::framesDroppedForResync` + 管线的 `decodeResyncs_` ——
+  前者数丢了多少帧，后者数**烧了几次**，两个数回答两个问题
+
+### 二、名不副实的标签：`fps` 打的不是 fps
+
+```cpp
+"fps=%llu latency samples=%llu ...",
+static_cast<unsigned long long>(window.samples),   // <- fps
+static_cast<unsigned long long>(window.samples),   // <- samples
+```
+
+同一个值打了两遍。`window.samples` 只有**同时满足**三条时才等于 fps：
+`statsIntervalMs == 1000`、每帧 `captureMs != 0`、每帧渲染成功。
+
+**最坏的地方是它在默认配置下碰巧对** —— 验收标准写着「fps 稳在 30」，它会通过。
+`--stats-interval=500` 一加，"fps" 就变成实际值的一半，而且没有任何征兆。
+
+**做法**：帧数差除以时间差，别拿一个"碰巧相等"的量顶替。
+
+```cpp
+const uint64_t fps = elapsedMs == 0 ? 0
+                   : (renderedNow - lastRendered) * 1000 / elapsedMs;
+```
+
+### 三、观测者效应：数字里含着测量工具自己的开销
+
+统计行的 `LOG_INFO` 在渲染线程的循环里，一秒一次 —— **频率完全合规**
+（CONVENTIONS 禁的是每帧一行）。但 `Logger` 是全局锁 + 无缓冲 stderr（见 [[D1]]）：
+
+```text
+30fps, 一秒一行  ->  每 30 帧就有 1 帧被这次写 stderr 拖一下
+                 ->  3.3% 的帧受影响, 而 3.3% > 1%
+                 ->  p95 和 p99 都会吃到它
+```
+
+采样点放在 `renderFrame()` 之后、日志之前，所以受影响的不是这一帧，是**下一帧**
+在队列 B 里的等待被拉长了。
+
+**做法**：不是"不许打"，是**在报告里声明**：
+
+> 统计日志的开销包含在后续帧的端到端延迟中。
+
+这跟 [[D10]] 那条"不含最后一次 vsync"是同一类声明 —— 都是**测不掉、只能说清楚**的部分。
+
+**一般规律（比三条结论本身重要）**
+
+> 每报出一个数字，问三句：
+>
+> 1. **它没覆盖到的那部分去哪了？** —— 被丢弃、被跳过、被拒绝的样本，
+>    往往恰好是最能说明问题的那批。它们不在分母里，数字就会往好看的方向偏。
+> 2. **它的名字和它的算法是同一件事吗？** —— 尤其警惕"当前参数下碰巧相等"的量：
+>    它会通过你所有的测试，然后在别人改一个参数时开始撒谎。
+> 3. **里面有没有测量行为自己的开销？** —— 测不掉的就声明，别包装成无侵入测量。
+
+对应 [[D10]] 那句：**一个说清楚了边界的数字是可信的；一个没说清边界的数字比没有数字更糟。**
+
+
+## D21. 「立刻停止」和「正常结束」的收尾动作不一样，写成同一条路径就会吃掉尾巴
+
+**症状**
+`--frames=100` 跑完，`renderer.framesRendered` 是 **98**。少两帧，不报错，不崩，
+每次跑少的数量还不太一样。而 `--idle-timeout` 那条路一帧不少。
+
+**机制**
+
+收包线程的计数和入队是两步，中间隔着一个 jitter buffer：
+
+```cpp
+writeFrame(frame);                    // ++stats_.framesWritten  <- maxFrames 数的是这个
+if (renderer_) jitter_.push(std::move(frame), now);   // 但帧刚进 jitter, 还没到 playAt
+
+if (config_.maxFrames > 0 && stats_.framesWritten >= maxFrames) {
+    completedNormally = true; break;  // 立刻走人
+}
+```
+
+`framesWritten` 达标的那一刻，jitter buffer 里还压着 `targetDelayMs / 33` ≈ **1~2 帧**
+没到放行时刻。收包线程 `break` 之后直接 `queueA_.close()`，这些帧就跟着没了。
+
+**为什么 `idleTimeout` 那条路没事**：它要等 500ms 静默才触发，那时所有帧早就过了
+`playAt`，在每轮循环的"检查到期帧"里已经被取走了。**同样一段收尾代码，两条路上
+表现完全不同** —— 这种 bug 只在其中一条路上出现，最容易被当成偶发。
+
+**做法**
+
+`completedNormally` 时不能直接关队列，要先把 jitter 里的尾巴等出来：
+
+```cpp
+while (jitter_.size() != 0 && !shouldStop(stopRequested)) {
+    const uint64_t now = steadyNowMs();
+    AssembledFrame due;
+    if (!jitter_.pop(due, now)) {          // 还没到 playAt, 等一小会
+        const int untilDue = jitter_.msUntilNextDue(now);
+        const int sleepMs = untilDue < 0 ? 1 : std::max(1, std::min(untilDue, 5));
+        std::this_thread::sleep_for(std::chrono::milliseconds(sleepMs));
+        continue;
+    }
+    queueA_.tryPush(...);
+}
+queueA_.close();
+```
+
+**这个循环一定会终止**，三条出口都堵死了：帧到期就被取走；`shouldStop` 一置位就退；
+队列满烧了保险丝的话 `dropUntilKeyFrame()` 会清空 `pending_`，`size()` 归零，
+循环自然结束。写等待循环时这三条要一条条数过。
+
+**一般规律**
+
+> **"立刻停止"和"正常结束"是两种收尾，动作不一样：**
+>
+> | | 想要的 | 该做的 |
+> |---|---|---|
+> | 立刻停止（Ctrl-C / 关窗口 / 故障） | **马上** | 置标志 + 唤醒所有阻塞点，队列里的数据直接丢 |
+> | 正常结束（收满 / 空闲超时 / EOF） | **一个不少** | 先顺流排空，再逐级关闭 |
+>
+> 把两者写成同一条路径，只有两种结局：要么按"立刻停止"写 —— 正常结束时吃掉尾巴；
+> 要么按"正常结束"写 —— 用户点了 × 还要等你把队列播完。
+
+这条和 [[D17]] [[D19]] 是同一条收尾路径上的三个角度：
+D17 是线程**醒不过来**，D19 是醒过来之后**说错话**，D21 是**走得太急**。
+
