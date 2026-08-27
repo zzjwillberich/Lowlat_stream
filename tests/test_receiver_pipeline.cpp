@@ -47,6 +47,8 @@ namespace {
         cfg.h264DumpPath = dump;
         cfg.recvTimeoutMs = 50;
         cfg.idleTimeoutMs = 500;
+        // 这些是 M2 的落盘契约测试：既不需要也不能依赖 SDL/解码器。
+        cfg.renderKind = "";
         return cfg;
     }
 

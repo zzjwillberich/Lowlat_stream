@@ -42,6 +42,11 @@ namespace {
         pipeline.maxFrames = config.getInt("frames", 0);
         pipeline.idleTimeoutMs = config.getInt("idle-timeout", 0);
         pipeline.recvTimeoutMs = config.getInt("recv-timeout", 200);
+        pipeline.renderKind = config.get("render", "sdl");
+        pipeline.jitter.targetDelayMs = config.getInt("jitter-ms", 50);
+        pipeline.decoder.threads = config.getInt("threads", 1);
+        pipeline.renderer.vsync = config.getInt("vsync", 0) != 0;
+        pipeline.statsIntervalMs = config.getInt("stats-interval", 1000);
         return pipeline;
     }
 }  // namespace
@@ -76,7 +81,9 @@ int main(int argc, char** argv) {
     const ReceiverPipelineStats& stats = pipeline.stats();
     LOG_INFO("receiver",
              "stopped: frames=%llu bytes=%llu key=%llu packets=%llu lost=%llu "
-             "malformed=%llu dropped=%llu recv_errors=%llu elapsed=%llums",
+             "malformed=%llu dropped=%llu recv_errors=%llu jitter_dropped=%llu "
+             "queue_dropped=%llu resyncs=%llu decoded=%llu rendered=%llu "
+             "queue_peak=%zu/%zu elapsed=%llums",
              static_cast<unsigned long long>(stats.framesWritten),
              static_cast<unsigned long long>(stats.bytesWritten),
              static_cast<unsigned long long>(stats.keyFrames),
@@ -85,6 +92,15 @@ int main(int argc, char** argv) {
              static_cast<unsigned long long>(stats.assembler.packetsMalformed),
              static_cast<unsigned long long>(stats.assembler.framesDropped),
              static_cast<unsigned long long>(stats.recvErrors),
+             static_cast<unsigned long long>(stats.jitter.framesTooLate +
+                                             stats.jitter.framesDropped +
+                                             stats.jitter.framesDroppedForResync),
+             static_cast<unsigned long long>(stats.decodeQueueDropped +
+                                             stats.renderQueueDropped),
+             static_cast<unsigned long long>(stats.decodeResyncs),
+             static_cast<unsigned long long>(stats.decoder.framesOut),
+             static_cast<unsigned long long>(stats.renderer.framesRendered),
+             stats.decodeQueuePeak, stats.renderQueuePeak,
              static_cast<unsigned long long>(stats.elapsedMs));
 
     if (!status.isOk()) {

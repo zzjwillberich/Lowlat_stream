@@ -28,7 +28,10 @@ namespace {
             // M1 编码参数
             || key == "dump" || key == "bitrate" || key == "gop" || key == "cap"
             // M2 传输参数
-            || key == "send-cap" || key == "recv-timeout" || key == "idle-timeout";
+            || key == "send-cap" || key == "recv-timeout" || key == "idle-timeout"
+            // M3 接收端解码渲染参数
+            || key == "render" || key == "jitter-ms" || key == "vsync"
+            || key == "threads" || key == "stats-interval";
     }
 }
 
@@ -208,5 +211,11 @@ void Config::printUsage() const {
         "  --send-cap <n>        Encoded frame queue capacity (default: 4)\n"
         "  --recv-timeout <ms>   Receiver poll timeout (default: 200)\n"
         "  --idle-timeout <ms>   Receiver idle timeout; 0 disables (default: 0)\n"
+        "Decode/render (receiver):\n"
+        "  --render <kind>       sdl, null, or empty for dump-only (default: sdl)\n"
+        "  --jitter-ms <n>       Target jitter-buffer delay (default: 50)\n"
+        "  --vsync <0|1>         Wait for vertical sync (default: 0)\n"
+        "  --threads <n>         Decoder thread count (default: 1)\n"
+        "  --stats-interval <ms> Receiver statistics interval; 0 disables (default: 1000)\n"
     );
 }

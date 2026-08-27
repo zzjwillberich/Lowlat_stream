@@ -169,6 +169,15 @@ struct ReceiverPipelineStats {
     size_t decodeQueuePeak = 0;
     size_t renderQueuePeak = 0;
 
+    /** @brief 队列 A 里被清空的编码帧，加上发现满时放弃的当前帧 */
+    uint64_t decodeQueueDropped = 0;
+
+    /** @brief 队列 B 被 forcePush() 淘汰的已解码裸帧数 */
+    uint64_t renderQueueDropped = 0;
+
+    /** @brief 队列 A 满而调用 dropUntilKeyFrame() 的次数；一次意味着最长一个 GOP 的冻结 */
+    uint64_t decodeResyncs = 0;
+
     uint64_t elapsedMs = 0;
 };
 
@@ -291,7 +300,8 @@ private:
     /**
      * @brief 发起收尾: 置标志 + 唤醒所有阻塞点
      *
-     * 四个触发源(Ctrl-C / 窗口关闭 / maxFrames 收满 / idleTimeout 空闲)共用这一个函数。
+     * Ctrl-C、窗口关闭和真正故障共用这一个函数。maxFrames 收满、idleTimeout 空闲
+     * 则是正常 EOF：收包线程先排空 jitter，再关闭队列 A，让解码/渲染顺序排空。
      *
      * @note **三件事必须一起做**, 少一条就有线程醒不过来, run() 的 join() 永远返回不了:
      *          stopping_ 让还在循环里的线程下一轮退出;
@@ -372,6 +382,12 @@ private:
 
     /** @brief 跨线程可见的统计快照 */
     ReceiverPipelineStats shared_;
+
+    /** @brief queueA_.tryPush 满时当前这帧已被按值传入、无法由队列自身计数 */
+    std::atomic<uint64_t> decodeQueueRejected_{0};
+
+    /** @brief 队列 A 保险丝触发次数；收包线程写、渲染线程读取统计快照 */
+    std::atomic<uint64_t> decodeResyncs_{0};
 
     /** @brief 复用的收包缓冲, 每次 recvFrom 都新建一个 vector 是纯浪费 */
     std::vector<uint8_t> recvBuf_;

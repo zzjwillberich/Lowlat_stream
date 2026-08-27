@@ -87,15 +87,26 @@ TEST(TransportLoopback, ReceiverReproducesTheSenderStreamByteForByte) {
     recvCfg.listen = Endpoint{"127.0.0.1", 0};
     recvCfg.h264DumpPath = files.received.string();
     recvCfg.recvTimeoutMs = 50;
-    recvCfg.idleTimeoutMs = 800;  // sender 发完就退出了, receiver 靠空闲判断收尾
+    recvCfg.maxFrames = FRAMES;   // 验证 --frames 也会排空 jitter/decoder 的尾帧
+    recvCfg.idleTimeoutMs = 0;
+    // 除了保留 M2 的逐字节验收，也让真实 H.264 穿过 M3 的 jitter、解码和
+    // NullRenderer；CI 不需要 DISPLAY。测试发送得很快，特意放大容量以免把
+    // 背压策略本身误当成传输丢包。
+    recvCfg.renderKind = "null";
+    recvCfg.decodeQueueCapacity = 64;
+    recvCfg.renderQueueCapacity = 64;
     ReceiverPipeline receiver(recvCfg);
     ASSERT_TRUE(receiver.open().isOk());
 
     std::atomic<bool> recvStop{false};
     auto recvDone = std::async(std::launch::async, [&] { return receiver.run(recvStop); });
 
-    SenderPipeline sender(std::make_unique<NullSource>(),
-                          senderConfig(receiver.boundPort(), files.sent.string()));
+    SenderPipelineConfig sendCfg = senderConfig(receiver.boundPort(), files.sent.string());
+    // 让 captureMs 严格前进并给 jitter 留出乱序吸收空间；1000fps 是 M2 的加速
+    // 参数，会违反 NullRenderer 的实时帧不变量，不适合端到端渲染验收。
+    sendCfg.source.fps = 30;
+    sendCfg.encoder.fps = 30;
+    SenderPipeline sender(std::make_unique<NullSource>(), std::move(sendCfg));
     std::atomic<bool> sendStop{false};
     ASSERT_TRUE(sender.run(sendStop).isOk());
 
@@ -114,6 +125,13 @@ TEST(TransportLoopback, ReceiverReproducesTheSenderStreamByteForByte) {
     EXPECT_EQ(rs.assembler.packetsReceived, ss.packetsSent);
     EXPECT_EQ(rs.assembler.packetsLost(), 0u) << "回环上丢包一定是自己写错了, 不是网络";
     EXPECT_EQ(rs.assembler.packetsMalformed, 0u);
+    EXPECT_EQ(rs.decoder.framesOut, ss.encodedFrames);
+    EXPECT_EQ(rs.renderer.framesRendered, ss.encodedFrames);
+    EXPECT_EQ(rs.renderer.framesRejected, 0u);
+    EXPECT_EQ(rs.latency.samples, ss.encodedFrames);
+    EXPECT_EQ(rs.decodeQueueDropped, 0u);
+    EXPECT_EQ(rs.renderQueueDropped, 0u);
+    EXPECT_EQ(rs.decodeResyncs, 0u);
 }
 
 /**
