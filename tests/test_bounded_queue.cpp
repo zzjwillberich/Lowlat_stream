@@ -170,6 +170,31 @@ TEST(BoundedQueue, TryPushFailsInsteadOfBlocking) {
     EXPECT_FALSE(q.tryPush(4));
 }
 
+TEST(BoundedQueue, ForcePushDropsTheOldestItemAndCountsIt) {
+    BoundedQueue<int> q(2);
+    ASSERT_TRUE(q.push(1));
+    ASSERT_TRUE(q.push(2));
+
+    ASSERT_TRUE(q.forcePush(3));
+    EXPECT_EQ(q.dropped(), 1u);
+
+    int value = 0;
+    ASSERT_TRUE(q.pop(value));
+    EXPECT_EQ(value, 2);
+    ASSERT_TRUE(q.pop(value));
+    EXPECT_EQ(value, 3);
+}
+
+TEST(BoundedQueue, ClearCountsEveryDiscardedItem) {
+    BoundedQueue<int> q(3);
+    ASSERT_TRUE(q.push(1));
+    ASSERT_TRUE(q.push(2));
+    q.clear();
+
+    EXPECT_EQ(q.size(), 0u);
+    EXPECT_EQ(q.dropped(), 2u);
+}
+
 // ========== peak 水位 ==========
 
 TEST(BoundedQueue, PeakTracksHighWaterMark) {

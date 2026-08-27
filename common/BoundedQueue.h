@@ -10,6 +10,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <mutex>
 #include <utility>
@@ -102,6 +103,33 @@ public:
     }
 
     /**
+     * @brief 向队尾插入元素，满时原子地丢弃最老元素
+     *
+     * @param item 要插入的元素，按值接收后 move 进队列
+     * @return true  插入成功
+     *         false 队列已 close
+     *
+     * @note 给实时消费端的泄压阀使用。调用方不能自行 pop() 再 push()：两个操作
+     *       之间消费者可能插进来，"丢最老再放最新"就不再是原子的。泛型队列只提供
+     *       原语，是否允许丢最老由知道数据语义的上层决定。
+     * @note 失败时 item 已被消耗，语义与 push()/tryPush() 一致。
+     */
+    bool forcePush(T item){
+        std::unique_lock<std::mutex> lk(mu_);
+        if(closed_) return false;
+
+        if(q_.size() >= cap_) {
+            q_.pop_front();
+            ++dropped_;
+        }
+        enqueueLocked(lk, std::move(item));
+
+        lk.unlock();
+        notEmpty_.notify_one();
+        return true;
+    }
+
+    /**
      * @brief 从队首取出一个元素, 队空时阻塞
      *
      * @param out 出参, 成功时被 move 赋值为队首元素
@@ -184,6 +212,21 @@ public:
     }
 
     /**
+     * @brief 丢弃当前所有积压元素，但保持队列可用
+     *
+     * @note 用于上层已经决定整段数据没有价值的场景。清空和随后入队之间仍由调用方
+     *       决定策略；本函数只保证消费者不会与 clear() 同时操作内部容器。
+     */
+    void clear(){
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            dropped_ += q_.size();
+            q_.clear();
+        }
+        notFull_.notify_all();
+    }
+
+    /**
      * @brief 当前队列中的元素个数
      *
      * @return 元素个数
@@ -208,12 +251,34 @@ public:
     }
 
     /**
+     * @brief 因 forcePush()/clear() 被本队列主动丢弃的元素总数
+     *
+     * @note 和 peak() 一样仅供观测；只统计容器里实际被移除的元素，不把调用方在
+     *       tryPush() 失败后自行放弃的那一份算进来。
+     */
+    uint64_t dropped() const{
+        std::lock_guard<std::mutex> lk(mu_);
+        return dropped_;
+    }
+
+    /**
      * @brief 队列容量
      *
      * @return 构造时传入的 cap
      */
     size_t capacity() const{
         return cap_;
+    }
+
+    /**
+     * @brief 队列是否已关闭
+     *
+     * @note 只用于消费者决定"close 后残留已经取空"时是否退出；不能替代 pop() 的
+     *       返回值做并发控制，因为状态在函数返回后随时可能变化。
+     */
+    bool isClosed() const{
+        std::lock_guard<std::mutex> lk(mu_);
+        return closed_;
     }
 
 private:
@@ -246,6 +311,9 @@ private:
      * @brief 历史最高水位
      */
     size_t peak_ = 0;
+
+    /** @brief forcePush()/clear() 主动移除的元素总数 */
+    uint64_t dropped_ = 0;
 
     /**
      * @brief 关闭标志, 只能由 false 变 true
