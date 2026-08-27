@@ -38,4 +38,5 @@ add_unit_test(test_jitter_buffer lltransport)    # M3.1 排序 + 按时放行 + 
 add_unit_test(test_sender_pipeline llsender)   # M1.4 采集 -> 队列 -> 编码管线
 add_unit_test(test_receiver_pipeline llreceiver)          # M2 收包 -> 组包 -> 落盘
 add_unit_test(test_transport_loopback llsender llreceiver llcapture)  # M2 验收: 两端字节一致
+add_unit_test(test_receiver_e2e llsender llreceiver llcapture)        # M3.5 验收: 三种收场与渲染档位
 add_unit_test(test_renderer llrender)            # M3.3 渲染器接口与两个实现
