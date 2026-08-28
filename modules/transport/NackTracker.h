@@ -88,7 +88,21 @@ struct NackTrackerStats {
      */
     uint64_t lostForReal = 0;
 
-    /** @brief 当前还在跟踪、尚未补齐也尚未放弃的 seq 数 */
+    /**
+     * @brief 当前还在跟踪、尚未补齐也尚未放弃的 seq 数
+     *
+     * @note **报告里必须和 lostForReal 一起给。** 不变式是:
+     *
+     *          丢掉的包总数 = recovered + givenUp + pending
+     *
+     *          流停止时, 最后那几个缺口既没用完重试次数、也没滑出窗口(没有新包推进),
+     *          会一直停在 pending 里 —— 于是 lostForReal 单独看是**漏报的**。
+     *          实测 10% 丢包 300 帧: injected=202, recovered=200, givenUp=0,
+     *          lostForReal=0, 而 pending=2 —— 只看 lostForReal 会得出"一个都没丢"。
+     *
+     *          本类不知道"流结束了", 所以不能自己把 pending 转成 lostForReal;
+     *          这个判断归调用方(它才知道 run() 要返回了)。
+     */
     size_t pending = 0;
 
     /**

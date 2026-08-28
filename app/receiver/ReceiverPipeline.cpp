@@ -170,17 +170,23 @@ Status ReceiverPipeline::validateConfig() const {
         return Status::error(Code::InvalidArg,
                              "ReceiverPipeline: --seed is required when --loss is positive");
     }
-    // TODO(M4.1): NACK 相关的校验
-    //   windowPackets == 0 表示"不发 NACK", 是合法的关闭方式;
-    //   但 windowPackets > 0 时下面几个必须站得住:
-    //     maxRequestsPerSeq <= 0     -> InvalidArg (0 次请求 = 缺口一出现就判死, 没有意义)
-    //     minReorderPackets == 0     -> InvalidArg (容忍为 0 等于把每次乱序都当丢包)
-    //     maxReorderPackets < minReorderPackets -> InvalidArg
-    //
-    //   注意 windowPackets == 0 现在会让 NackTracker 把**每一次跳号**都当成流不连续
-    //   (forwardDistance >= 0 恒成立), discontinuities 狂涨而 NACK 完全不工作。
-    //   那是静默空转, 和"给了 --loss 没给 --seed"同一族 —— 所以要么在这里挡掉, 要么
-    //   在 open() 里干脆不喂跟踪器。选后者的话这条校验就不需要, 但得确保真的不喂。
+    if (config_.nack.windowPackets > 0) {
+        if (config_.nack.maxRequestsPerSeq <= 0) {
+            return Status::error(
+                Code::InvalidArg,
+                "ReceiverPipeline: NACK max requests per seq must be positive");
+        }
+        if (config_.nack.minReorderPackets == 0) {
+            return Status::error(
+                Code::InvalidArg,
+                "ReceiverPipeline: NACK minimum reorder packets must be positive");
+        }
+        if (config_.nack.maxReorderPackets < config_.nack.minReorderPackets) {
+            return Status::error(
+                Code::InvalidArg,
+                "ReceiverPipeline: NACK maximum reorder packets must not be smaller than minimum");
+        }
+    }
     return Status::ok();
 }
 
@@ -514,39 +520,67 @@ void ReceiverPipeline::trackPeer(const uint8_t* packet, size_t len, const Endpoi
         return;
     }
 
-    // TODO(M4.1): 对端换了就 nackTracker_.reset()。
-    //   sender 每次启动的源端口由内核随机分配, 而 Packetizer 的 initialSeq 默认 0 ——
-    //   也就是重启后 seq 从头开始。跟踪器里的 highestSeq_ 还停在旧流的位置,
-    //   新流的包全部被判成"迟到包"忽略, **一个 NACK 都不会发**。
-    //   盲区长度 = 旧的 highestSeq_ 个包: 刚跑过 100 帧是 4.7 秒,
-    //   接收端挂了一小时就是一个多小时。
-    //   判据是 peer_ 变了(ip 或 port 任一不同), 不是"第一次设置"。
-    //   Endpoint 现在没有 operator==, 逐字段比就行, 别为这一处加运算符。
+    if (peer_.ip != from.ip || peer_.port != from.port) {
+        nackTracker_.reset();
+    }
     peer_ = from;
 }
 
 void ReceiverPipeline::requestRetransmissions(const uint8_t* packet, size_t len) {
-    // TODO(M4.1):
-    //   1. config_.nack.windowPackets == 0 -> return  (关掉时零开销, 放第一行)
-    //   2. 解 PacketHeader + DataHeader; 不是合法 DATA 包 -> return
-    //      (FEC 包也占 seq 空间, 但它丢了不该请求重传 —— 冗余包本来就是"丢了不要紧"的)
-    //   3. nackTracker_.onPacket(header.seq, dataHeader.fragCount)
-    //   4. nackTracker_.collectNackTargets(nackTargets_); 空 -> return
-    //   5. peer_.port == 0 -> return
-    //      还没见过对端就发, sendTo 会因 Endpoint{"", 0} 返回 InvalidArg ——
-    //      那是"本端调用错误"的语义, 不该在正常启动阶段出现
-    //   6. 组包: PacketHeader{type = Nack, streamId = 0, seq = nackSeq_++,
-    //            timestampMs = static_cast<uint32_t>(steadyNowMs())}
-    //      **nackSeq_ 和 DATA 的 seq 空间无关**, 两个方向各数各的
-    //   7. encodeNackPacket(...) -> socket_.sendTo(peer_, ...)
-    //      成功 -> ++nackPacketsSent_; 失败 -> ++nackSendErrors_
-    //
-    // 截断: nackTargets_ 超过一个包装得下的量时**只发前面一批**, 剩下的留到下一轮
-    //   (collectNackTargets 自己有限流, 下一轮很快)。不过按默认配置这条走不到 ——
-    //   一个 NACK 包装得下整个 1024 的跟踪窗口, 见 Packet.h 的 MAX_NACK_ENTRIES。
-    //   走到了就是配置被改大了, encodeNackPacket 会返回 Internal 提醒你。
-    (void)packet;
-    (void)len;
+    if (config_.nack.windowPackets == 0) return;
+
+    PacketHeader header;
+    if (!decodePacketHeader(packet, len, header).isOk() ||
+        header.type != PacketType::Data) {
+        return;
+    }
+
+    DataHeader dataHeader;
+    if (!decodeDataHeader(packet + PACKET_HEADER_SIZE, len - PACKET_HEADER_SIZE,
+                          dataHeader)
+             .isOk()) {
+        return;
+    }
+
+    nackTracker_.onPacket(header.seq, dataHeader.fragCount);
+    nackTracker_.collectNackTargets(nackTargets_);
+    if (nackTargets_.empty() || peer_.port == 0) return;
+
+    // 一个包放不下时只发最老的前缀。按编码器的贪心分条规则
+    // 计算截断点，而不是简单截 MAX_NACK_ENTRIES 个 seq。
+    size_t sendCount = 0;
+    size_t entryCount = 0;
+    while (sendCount < nackTargets_.size() && entryCount < MAX_NACK_ENTRIES) {
+        const uint32_t pid = nackTargets_[sendCount++];
+        ++entryCount;
+        while (sendCount < nackTargets_.size() &&
+               nackTargets_[sendCount] - pid < NACK_SEQS_PER_ENTRY) {
+            ++sendCount;
+        }
+    }
+    if (sendCount < nackTargets_.size()) nackTargets_.resize(sendCount);
+
+    PacketHeader nackHeader;
+    nackHeader.type = PacketType::Nack;
+    nackHeader.streamId = 0;
+    nackHeader.seq = nackSeq_++;
+    nackHeader.timestampMs = static_cast<uint32_t>(steadyNowMs());
+
+    if (nackBuf_.empty()) nackBuf_.resize(MAX_DATA_PACKET_SIZE);
+    size_t nackLen = 0;
+    const Status encodeStatus =
+        encodeNackPacket(nackHeader, nackTargets_, nackBuf_.data(), nackBuf_.size(), nackLen);
+    if (!encodeStatus.isOk()) {
+        ++nackSendErrors_;
+        return;
+    }
+
+    const Status sendStatus = socket_.sendTo(peer_, nackBuf_.data(), nackLen);
+    if (sendStatus.isOk()) {
+        ++nackPacketsSent_;
+    } else {
+        ++nackSendErrors_;
+    }
 }
 
 bool ReceiverPipeline::shouldInjectDrop(const uint8_t* packet, size_t len) {

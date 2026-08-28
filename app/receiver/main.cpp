@@ -105,7 +105,7 @@ int main(int argc, char** argv) {
              "malformed=%llu dropped=%llu recv_errors=%llu jitter_dropped=%llu "
              "queue_dropped=%llu resyncs=%llu injected_drops=%llu "
              "nack_sent=%llu nack_seqs=%llu nack_recovered=%llu nack_gaveup=%llu "
-             "lost_exact=%llu decoded=%llu "
+             "lost_exact=%llu nack_pending=%zu decoded=%llu "
              "rendered=%llu queue_peak=%zu/%zu elapsed=%llums",
              static_cast<unsigned long long>(stats.framesWritten),
              static_cast<unsigned long long>(stats.bytesWritten),
@@ -127,6 +127,7 @@ int main(int argc, char** argv) {
              static_cast<unsigned long long>(stats.nack.recovered),
              static_cast<unsigned long long>(stats.nack.givenUp),
              static_cast<unsigned long long>(stats.nack.lostForReal),
+             stats.nack.pending,
              static_cast<unsigned long long>(stats.decoder.framesOut),
              static_cast<unsigned long long>(stats.renderer.framesRendered),
              stats.decodeQueuePeak, stats.renderQueuePeak,

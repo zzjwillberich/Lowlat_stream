@@ -12,7 +12,9 @@
 #include "common/Status.h"
 #include "modules/capture/Frame.h"
 #include "modules/encode/Encoder.h"
+#include "modules/transport/Packet.h"
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <thread>
@@ -99,12 +101,20 @@ Status SenderPipeline::validateConfig() const {
             return Status::error(Code::InvalidArg,
                                  "SenderPipeline: target port must be positive");
         }
-        // TODO(M4.1): 重传相关的三条校验
-        //   1. retransmit.retentionMs < 0 -> InvalidArg (0 是"关掉重传", 合法)
-        //   2. sendPollMs <= 0 -> InvalidArg
-        //      0 会让 popFor 变成忙轮询, 烧满一个核; 负数语义未定义。
-        //      同 recvTimeoutMs 那条 —— 这条线程要靠这个超时定期回来收 NACK。
-        //   3. reversePacketsPerIteration < 0 -> InvalidArg (0 表示不限, 合法)
+        if (config_.retransmit.retentionMs < 0) {
+            return Status::error(
+                Code::InvalidArg,
+                "SenderPipeline: retransmit retention must be non-negative");
+        }
+        if (config_.sendPollMs <= 0) {
+            return Status::error(Code::InvalidArg,
+                                 "SenderPipeline: send poll timeout must be positive");
+        }
+        if (config_.reversePacketsPerIteration < 0) {
+            return Status::error(
+                Code::InvalidArg,
+                "SenderPipeline: reverse packets per iteration must be non-negative");
+        }
     }
 
     const SourceConfig& sourceConfig = config_.source;
@@ -181,14 +191,11 @@ Status SenderPipeline::openResources() {
             closeResources();
             return st;
         }
-        // TODO(M4.1): retransmit.retentionMs > 0 时创建 retransmitCache_,
-        //   并 reverseBuf_.resize(MAX_DATA_PACKET_SIZE)。
-        //   为 0 时保持 nullptr —— drainReverseChannel 靠它判断"这一级不存在",
-        //   同 target.ip 为空时不建 sendQueue_ 的写法。
-        //
-        //   socket_ 不需要 bind: sendTo 时内核会自动分配一个源端口, 而接收端认的
-        //   正是那个端口(它把 recvFrom 的 from 存下来当 peer_)。所以反向通道
-        //   **不需要任何额外配置**, 这也是当初选"收发共用一个 socket"的主要收益。
+        if (config_.retransmit.retentionMs > 0) {
+            retransmitCache_ =
+                std::make_unique<RetransmitCache>(config_.retransmit);
+            reverseBuf_.resize(MAX_DATA_PACKET_SIZE);
+        }
     }
 
     if(!config_.rawDumpPath.empty()){
@@ -300,55 +307,44 @@ void SenderPipeline::encodeLoop() {
 void SenderPipeline::sendLoop() {
     sendStatus_ = Status::ok();
 
-    // TODO(M4.1): 这个 while 要改成"同时等两件事"的形状。队列是条件变量、socket 是 fd,
-    //   poll 等不了条件变量, 所以走 D16 的老办法: 带超时地等队列, 每轮顺便收一轮 socket。
-    //
-    //   while (!(sendQueue_->popFor(frame, ms(config_.sendPollMs)))) 这样写不对 ——
-    //   popFor 返回 false 时"超时"和"关闭后已取空"是同一个值, 要靠 isClosed() 区分,
-    //   同 renderLoop 里那段:
-    //
-    //     for (;;) {
-    //         std::unique_ptr<EncodedFrame> frame;
-    //         if (sendQueue_->popFor(frame, milliseconds(config_.sendPollMs))) {
-    //             ...原来的打包发送...
-    //             // 打完包之后把帧移进重传缓存(**这里是 move, 不是拷贝**):
-    //             // retransmitCache_->store(view, std::move(frame->data), baseSeq,
-    //             //                         fragCount, steadyNowMs());
-    //             // baseSeq 要在 packetize **之前**读 packetizer_.nextSeq() —— 之后读到的
-    //             // 已经是下一帧的起点了。这是个很容易写反、而且只在有重传时才暴露的错。
-    //         } else if (sendQueue_->isClosed()) {
-    //             break;
-    //         }
-    //         drainReverseChannel();   // 不管有没有帧, 都收一轮
-    //     }
-    //
-    //   收尾还要注意: 队列关闭并取空之后就 break, 不要为了"把剩下的 NACK 处理完"
-    //   多等一轮 —— 那是 D21 说的"正常结束"和"立刻停止"混在一起。流都停了,
-    //   重传出去的包接收端也早过了 playAt。
+    for (;;) {
+        std::unique_ptr<EncodedFrame> frame;
+        if (sendQueue_->popFor(frame,
+                               std::chrono::milliseconds(config_.sendPollMs))) {
+            EncodedFrameView view;
+            view.data = frame->data.data();
+            view.len = frame->data.size();
+            view.frameId = frame->frameId;
+            view.captureMs = frame->captureMs;
+            view.isKey = frame->isKey;
 
-    std::unique_ptr<EncodedFrame> frame;
-    while (sendQueue_->pop(frame)) {
-        EncodedFrameView view;
-        view.data = frame->data.data();
-        view.len = frame->data.size();
-        view.frameId = frame->frameId;
-        view.captureMs = frame->captureMs;
-        view.isKey = frame->isKey;
+            const uint32_t baseSeq = packetizer_.nextSeq();
+            sendStatus_ = packetizer_.packetize(view, packets_);
+            if (!sendStatus_.isOk()) {
+                break;
+            }
 
-        sendStatus_ = packetizer_.packetize(view, packets_);
-        if (!sendStatus_.isOk()) {
+            for (const PacketBuffer& packet : packets_) {
+                const Status status =
+                    socket_.sendTo(config_.target, packet.data(), packet.size());
+                if (status.isOk()) {
+                    ++stats_.packetsSent;
+                } else {
+                    ++stats_.sendErrors;
+                }
+            }
+
+            if (retransmitCache_) {
+                const uint16_t fragCount =
+                    static_cast<uint16_t>(packets_.size());
+                retransmitCache_->store(view, std::move(frame->data), baseSeq,
+                                        fragCount, steadyNowMs());
+            }
+        } else if (sendQueue_->isClosed()) {
             break;
         }
 
-        for (const PacketBuffer& packet : packets_) {
-            const Status status =
-                socket_.sendTo(config_.target, packet.data(), packet.size());
-            if (status.isOk()) {
-                ++stats_.packetsSent;
-            } else {
-                ++stats_.sendErrors;
-            }
-        }
+        drainReverseChannel();
     }
 
     if (!sendStatus_.isOk()) {
@@ -359,28 +355,59 @@ void SenderPipeline::sendLoop() {
 }
 
 void SenderPipeline::drainReverseChannel() {
-    // TODO(M4.1):
-    //   1. retransmitCache_ 为空(retentionMs == 0) -> 直接返回。
-    //      关掉重传时连 recvFrom 都不该走 —— 每轮多一次 syscall 去等一个永远不来的包。
-    //   2. 循环最多 config_.reversePacketsPerIteration 次(0 表示不限):
-    //      a. socket_.recvFrom(reverseBuf_, ..., from, /*timeoutMs=*/0)
-    //         Timeout -> 没包了, break(**这是正常情况, 不是错误, 别计 sendErrors**)
-    //         其它非 Ok -> ++sendErrors, break
-    //      b. decodeNackPacket(reverseBuf_, len, nackedSeqs_)
-    //         失败 -> ++reverseMalformed, continue
-    //         (端口上收到垃圾是常态; 和 NACK 计数分开, 同 lost / malformed 的理由)
-    //      c. ++nacksReceived; stats_.nackedSeqs += nackedSeqs_.size()
-    //      d. 对每个 seq: retransmitCache_->find(...)
-    //           命中 -> packetizeOneFragment(streamId, seq, view, fragIndex, fragCount,
-    //                                        /*isRetransmit=*/true, retransmitBuf_)
-    //                   -> socket_.sendTo(**from**, ...) -> ++packetsRetransmitted
-    //           未命中 -> ++retransmitMisses
-    //
-    //   目的地用 from 而不是 config_.target: 跨 NAT 时只有"回到来源地址"的包能通。
-    //   M4 全在回环上两者相同, 但写对了就不用等到跨机器再返工。
-    //
-    //   重传的包**不计入 packetsSent** —— 那个数是"原发了多少", 混进重传之后
-    //   "接收端收到的包数 vs 发送端发出的包数"这个对账就再也对不上了。
+    if (!retransmitCache_) return;
+
+    retransmitCache_->evictExpired(steadyNowMs());
+
+    int packetsProcessed = 0;
+    while (config_.reversePacketsPerIteration == 0 ||
+           packetsProcessed < config_.reversePacketsPerIteration) {
+        size_t receivedBytes = 0;
+        Endpoint from;
+        const Status receiveStatus =
+            socket_.recvFrom(reverseBuf_.data(), reverseBuf_.size(), receivedBytes,
+                             from, 0);
+        if (receiveStatus.code() == Code::Timeout) break;
+        if (!receiveStatus.isOk()) {
+            ++stats_.sendErrors;
+            break;
+        }
+        ++packetsProcessed;
+
+        if (!decodeNackPacket(reverseBuf_.data(), receivedBytes, nackedSeqs_)
+                 .isOk()) {
+            ++stats_.reverseMalformed;
+            continue;
+        }
+
+        ++stats_.nacksReceived;
+        stats_.nackedSeqs += nackedSeqs_.size();
+        for (uint32_t seq : nackedSeqs_) {
+            EncodedFrameView view;
+            uint16_t fragIndex = 0;
+            uint16_t fragCount = 0;
+            if (!retransmitCache_->find(seq, view, fragIndex, fragCount)) {
+                ++stats_.retransmitMisses;
+                continue;
+            }
+
+            const Status packetStatus =
+                packetizeOneFragment(packetizer_.streamId(), seq, view, fragIndex,
+                                     fragCount, true, retransmitBuf_);
+            if (!packetStatus.isOk()) {
+                ++stats_.sendErrors;
+                continue;
+            }
+
+            const Status sendStatus =
+                socket_.sendTo(from, retransmitBuf_.data(), retransmitBuf_.size());
+            if (sendStatus.isOk()) {
+                ++stats_.packetsRetransmitted;
+            } else {
+                ++stats_.sendErrors;
+            }
+        }
+    }
 }
 
 Status SenderPipeline::writeEncodedFrame(const EncodedFrame& frame) {
