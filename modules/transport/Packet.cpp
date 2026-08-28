@@ -155,7 +155,7 @@ bool seqNewerThan(uint32_t a, uint32_t b) {
 
 Status encodeNackPacket(const PacketHeader& header, const std::vector<uint32_t>& missing,
                         uint8_t* buf, size_t bufLen, size_t& outLen) {
-    // TODO(M4.1):
+    // 编码前必须先完成所有可能失败的检查:
     //   1. 参数校验(全部前置, 失败时 buf 和 outLen 都不动):
     //      buf == nullptr -> InvalidArg
     //      missing.empty() -> InvalidArg     (空 NACK 没有意义)
@@ -173,16 +173,69 @@ Status encodeNackPacket(const PacketHeader& header, const std::vector<uint32_t>&
     //   [1, 16] 的置进 blp 的第 (d-1) 位, 然后跳到第一个 d > 16 的 seq 作下一条的 pid。
     //   **距离要用无符号减法算**, seq 会回绕, 直接比大小会在回绕点分错条。
     //   不要求最优分条 —— 最优解省不下几个字节, 分条逻辑越绕越容易出错。
-    (void)header;
-    (void)missing;
-    (void)buf;
-    (void)bufLen;
-    (void)outLen;
-    return Status::error(Code::Internal, "encodeNackPacket: not implemented");
+    if (buf == nullptr) {
+        return Status::error(Code::InvalidArg, "encodeNackPacket: buf must not be null");
+    }
+    if (missing.empty()) {
+        return Status::error(Code::InvalidArg, "encodeNackPacket: missing must not be empty");
+    }
+    if (header.type != PacketType::Nack) {
+        return Status::error(Code::InvalidArg,
+                             "encodeNackPacket: header type must be Nack");
+    }
+
+    struct Entry {
+        uint32_t pid;
+        uint16_t blp;
+    };
+    std::vector<Entry> entries;
+    entries.reserve(std::min(missing.size(), MAX_NACK_ENTRIES + 1));
+
+    size_t next = 0;
+    while (next < missing.size()) {
+        Entry entry{missing[next++], 0};
+        while (next < missing.size()) {
+            const uint32_t distance = missing[next] - entry.pid;
+            if (distance > 16) break;
+            if (distance != 0) {
+                entry.blp |= static_cast<uint16_t>(1u << (distance - 1));
+            }
+            ++next;
+        }
+        entries.push_back(entry);
+        if (entries.size() > MAX_NACK_ENTRIES) {
+            return Status::error(Code::Internal,
+                                 "encodeNackPacket: too many bitmap entries");
+        }
+    }
+
+    const size_t encodedLen = PACKET_HEADER_SIZE + NACK_HEADER_SIZE +
+                              entries.size() * NACK_ENTRY_SIZE;
+    if (bufLen < encodedLen) {
+        return Status::error(Code::Internal,
+                             "encodeNackPacket: output buffer is too small");
+    }
+
+    const Status headerStatus = encodePacketHeader(header, buf, bufLen);
+    if (!headerStatus.isOk()) return headerStatus;
+
+    const uint16_t entryCountNet = htons(static_cast<uint16_t>(entries.size()));
+    std::memcpy(buf + PACKET_HEADER_SIZE, &entryCountNet, sizeof(entryCountNet));
+
+    for (size_t i = 0; i < entries.size(); ++i) {
+        const size_t offset = PACKET_HEADER_SIZE + NACK_HEADER_SIZE + i * NACK_ENTRY_SIZE;
+        const uint32_t pidNet = htonl(entries[i].pid);
+        const uint16_t blpNet = htons(entries[i].blp);
+        std::memcpy(buf + offset, &pidNet, sizeof(pidNet));
+        std::memcpy(buf + offset + sizeof(pidNet), &blpNet, sizeof(blpNet));
+    }
+
+    outLen = encodedLen;
+    return Status::ok();
 }
 
 Status decodeNackPacket(const uint8_t* buf, size_t bufLen, std::vector<uint32_t>& out) {
-    // TODO(M4.1):
+    // 先完成包头、计数和精确长度校验, 再读取任何位图条目:
     //   out.clear() 先做 —— 调用方复用这个 vector
     //   1. buf == nullptr -> InvalidArg
     //   2. decodePacketHeader 拿到头(它自己会查版本和类型合法性);
@@ -195,8 +248,60 @@ Status decodeNackPacket(const uint8_t* buf, size_t bufLen, std::vector<uint32_t>
     //      实际长度相符, 否则就是一次越界读 —— UDP 上收到的每个字节都是不可信输入。
     //   6. 逐条读 pid + blp, 展开成 seq 列表: 先 push pid, 再对 blp 的第 i 位
     //      (i = 0..15) 为 1 的 push (pid + 1 + i)。顺序与编码时一致(从老到新)。
-    (void)buf;
-    (void)bufLen;
-    (void)out;
-    return Status::error(Code::Internal, "decodeNackPacket: not implemented");
+    out.clear();
+    if (buf == nullptr) {
+        return Status::error(Code::InvalidArg, "decodeNackPacket: buf must not be null");
+    }
+
+    PacketHeader header;
+    const Status headerStatus = decodePacketHeader(buf, bufLen, header);
+    if (!headerStatus.isOk()) {
+        if (headerStatus.code() == Code::InvalidArg) {
+            return Status::error(Code::NetError,
+                                 "decodeNackPacket: packet is smaller than PacketHeader");
+        }
+        return headerStatus;
+    }
+    if (header.type != PacketType::Nack) {
+        return Status::error(Code::NetError, "decodeNackPacket: packet type is not Nack");
+    }
+    if (bufLen < PACKET_HEADER_SIZE + NACK_HEADER_SIZE) {
+        return Status::error(Code::NetError,
+                             "decodeNackPacket: packet is smaller than NackHeader");
+    }
+
+    uint16_t entryCountNet;
+    std::memcpy(&entryCountNet, buf + PACKET_HEADER_SIZE, sizeof(entryCountNet));
+    const uint16_t entryCount = ntohs(entryCountNet);
+    if (entryCount == 0 || entryCount > MAX_NACK_ENTRIES) {
+        return Status::error(Code::NetError,
+                             "decodeNackPacket: invalid bitmap entry count");
+    }
+
+    const size_t expectedLen = PACKET_HEADER_SIZE + NACK_HEADER_SIZE +
+                               static_cast<size_t>(entryCount) * NACK_ENTRY_SIZE;
+    if (bufLen != expectedLen) {
+        return Status::error(Code::NetError,
+                             "decodeNackPacket: length does not match entry count");
+    }
+
+    out.reserve(static_cast<size_t>(entryCount) * NACK_SEQS_PER_ENTRY);
+    for (size_t entryIndex = 0; entryIndex < entryCount; ++entryIndex) {
+        const size_t offset = PACKET_HEADER_SIZE + NACK_HEADER_SIZE +
+                              entryIndex * NACK_ENTRY_SIZE;
+        uint32_t pidNet;
+        uint16_t blpNet;
+        std::memcpy(&pidNet, buf + offset, sizeof(pidNet));
+        std::memcpy(&blpNet, buf + offset + sizeof(pidNet), sizeof(blpNet));
+
+        const uint32_t pid = ntohl(pidNet);
+        const uint16_t blp = ntohs(blpNet);
+        out.push_back(pid);
+        for (uint32_t bit = 0; bit < 16; ++bit) {
+            if ((blp & static_cast<uint16_t>(1u << bit)) != 0) {
+                out.push_back(pid + 1 + bit);
+            }
+        }
+    }
+    return Status::ok();
 }

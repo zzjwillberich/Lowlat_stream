@@ -177,6 +177,26 @@ TEST(NackPacket, TooManyEntriesIsAnInternalErrorNotAProtocolError) {
 
 // ---------- 参数与畸形 ----------
 
+/**
+ * 两种"装不下"要用不同的错误码, 因为读到报错的人反应完全不同:
+ *   bufLen 不够       -> InvalidArg, 调用方参数给小了, 改调用处
+ *   条目超过上限      -> Internal,   那个上限是本文件算出来的, 改这个文件
+ *                                    (或者调用方该先截断)
+ * 混成一个码就分不清该改哪边 —— 这是 PROTOCOL.md「畸形包的处理」定下的规矩,
+ * encodePacketHeader / encodeDataHeader 对 bufLen 不足都返回 InvalidArg。
+ */
+TEST(NackPacket, ASmallBufferIsACallerErrorNotAnInternalOne) {
+    std::vector<uint8_t> buf(MAX_DATA_PACKET_SIZE);
+    size_t len = 0;
+    const size_t needed = PACKET_HEADER_SIZE + NACK_HEADER_SIZE + NACK_ENTRY_SIZE;
+
+    EXPECT_TRUE(encodeNackPacket(nackHeader(), {42}, buf.data(), needed, len).isOk())
+        << "刚好够就该成功";
+    EXPECT_EQ(encodeNackPacket(nackHeader(), {42}, buf.data(), needed - 1, len).code(),
+              Code::InvalidArg)
+        << "缓冲区小一个字节是调用方的参数问题, 不是本文件算错了";
+}
+
 TEST(NackPacket, EncodeRejectsBadArguments) {
     std::vector<uint8_t> buf(MAX_DATA_PACKET_SIZE);
     size_t len = 0;

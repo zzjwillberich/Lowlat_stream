@@ -252,9 +252,15 @@ constexpr size_t MAX_NACK_ENTRIES = (MAX_DATA_PACKET_SIZE - PACKET_HEADER_SIZE -
  * @param outLen  出参, 实际写入的字节数
  *
  * @return Ok         编码成功
- *  InvalidArg missing 为空 / header.type 不是 Nack / buf 为空
- *  Internal   装不下 —— 缓冲是按线上长度算好的, 装不下只可能是本端算错了,
- *                       不是坏输入。调用方超了应当**先截断再调**, 不要靠这个错误兜底
+ *  InvalidArg missing 为空 / header.type 不是 Nack / buf 为空 / **bufLen 不足**
+ *  Internal   分条数超过 MAX_NACK_ENTRIES
+ *
+ * @note 两种"装不下"是不同的错误, 别混:
+ *          - `bufLen` 不够 -> InvalidArg, 同 encodePacketHeader/encodeDataHeader,
+ *            调用方参数给小了, 反应是"改调用处";
+ *          - 分条数超过 MAX_NACK_ENTRIES -> Internal, 那个上限是本文件按线上长度
+ *            算出来的常量, 超了说明本端算错了或者调用方没有**先截断再调**。
+ *          混成一个错误码, 拿到报错的人就分不清该改自己的调用还是该来改这个文件。
  *
  * @note 分条规则: 取第一个未编码的 seq 作 pid, 把它之后 16 个 seq 里也缺的置进 blp,
  *          然后跳到下一个未覆盖的 seq。**贪心即可**, 不需要求最优分条 ——
