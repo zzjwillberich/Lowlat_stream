@@ -384,7 +384,7 @@ bug 藏起来。触发条件：M4 做背压策略时。
 
 ## 踩坑记录
 
-完整版见 [docs/NOTES.md](docs/NOTES.md)（21 条），这里挑几个典型的。
+完整版见 [docs/NOTES.md](docs/NOTES.md)（22 条），这里挑几个典型的。
 
 ### 1. 头文件里在类外定义函数，必须加 `inline`
 

@@ -22,6 +22,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <vector>
 
 /**
@@ -89,6 +90,16 @@ struct NackTrackerStats {
 
     /** @brief 当前还在跟踪、尚未补齐也尚未放弃的 seq 数 */
     size_t pending = 0;
+
+    /**
+     * @brief 跳号超过一整个窗口而重新建立基线的次数
+     *
+     * @note **必须报出来, 不能静默重建**。静默的话"包被打乱了"和"对端换了一条流"
+     *          两件事在外面看起来完全一样, 而它们的处置方式不同。
+     *          稳态下这个数应当恒为 0; 非 0 就说明有东西在往这个端口上发不该发的包,
+     *          或者对端重启了而 reset() 没被调用。
+     */
+    uint64_t discontinuities = 0;
 };
 
 /**
@@ -126,6 +137,21 @@ public:
      *
      * @note seq 会回绕。比较大小一律用 seqNewerThan(Packet.h), 直接 `a > b`
      *          在 0xFFFFFFFF -> 0 处会把最新的包判成最老的。
+     *
+     * @note **跳号超过 windowPackets 时按"换了一条流"处理**: 像首包一样重新建立基线,
+     *          既不登记缺口也不计任何丢包, 只 ++discontinuities。
+     *
+     *          理由: seqNewerThan 只保证差值为正, 上界是 2^31 —— 而 seq 是包头里
+     *          **唯一没有任何校验的字段**(版本、类型、分片自洽性 M2 都查了,
+     *          但 seq 的每一个 32 位取值都合法)。一个位翻转、一个上一轮残留的包、
+     *          同端口上另一个进程, 都能让 forwardDistance 变成十亿级。
+     *
+     *          不堵的话两层后果: lostForReal 被永久污染(而它正是这个类存在的理由 ——
+     *          M4 的"X% 丢包下不花屏"里那个 X 靠它), 以及为 windowPackets 个
+     *          **根本不存在的包**登记幻影缺口, 接下来是一场 NACK 风暴。
+     *
+     *          阈值取 windowPackets 而不是另立一个: 窗口外的包本来就救不回来
+     *          (重传赶不上 playAt), 跳过一整个窗口意味着连续性已经没有意义了。
      */
     void onPacket(uint32_t seq, uint16_t fragCount);
 
@@ -156,12 +182,22 @@ public:
     void reset();
 
 private:
+    struct GapState {
+        int requestCount = 0;
+        uint32_t lastRequestAtHighestSeq = 0;
+    };
+
     NackTrackerConfig config_;
     NackTrackerStats stats_;
 
-    // TODO(M4.1): 自己选数据结构。两条硬约束:
-    //   - 内存必须有界(windowPackets 封顶), 理由同 FrameAssembler 的 maxPendingFrames;
-    //   - 每个缺口要记住: 已请求几次、上次请求时 highestSeq 是多少(用来判"再等一帧")。
-    // 提示: seq 是稠密自增的, 用"环形位图 + 一个小表"比 std::map<uint32_t, ...> 省得多,
-    //       但先写对再说 —— 233 包/秒的规模下 map 也完全够用, 别一上来就优化。
+    /** @brief 当前未收到的 seq 及其请求限流状态 */
+    std::map<uint32_t, GapState> gaps_;
+
+    /** @brief 最新的已收 seq; 只在 hasBaseline_ 为 true 时有效 */
+    uint32_t highestSeq_ = 0;
+
+    /** @brief 最近一个合法 DATA 包给出的自适应乱序容忍 */
+    uint32_t reorderPackets_ = 0;
+
+    bool hasBaseline_ = false;
 };

@@ -269,3 +269,70 @@ TEST(NackTracker, ResetForgetsEverything) {
     tracker.onPacket(90000, FRAGS_PER_FRAME);
     EXPECT_TRUE(collect(tracker).empty());
 }
+
+// ---------- 流不连续 ----------
+
+/**
+ * seq 是包头里**唯一没有任何校验的字段**: 版本、类型、分片自洽性 M2 都查了,
+ * 但 seq 的每一个 32 位取值都合法, 所以它能带着任意值穿过全部现有闸门。
+ *
+ * 而 seqNewerThan 只保证差值为正, 上界是 2^31 —— 一个位翻转、一个上一轮残留的包、
+ * 同端口上另一个进程, 都能让 forwardDistance 变成十亿级。不堵的话:
+ *   - lostForReal 被永久污染(实测一个包就从 0 跳到 999998977),
+ *     而它正是这个类存在的理由 —— M4 的"X% 丢包下不花屏"里那个 X 靠它;
+ *   - 为一整个窗口的**根本不存在的包**登记幻影缺口, 接下来是一场 NACK 风暴。
+ */
+TEST(NackTracker, AHugeSeqJumpIsTreatedAsANewStreamNotAsMassiveLoss) {
+    NackTrackerConfig cfg = config();
+    cfg.windowPackets = 256;
+    NackTracker tracker(cfg);
+
+    feedRange(tracker, 1000, 1100);
+    ASSERT_EQ(tracker.stats().lostForReal, 0u);
+    ASSERT_EQ(tracker.stats().pending, 0u);
+
+    tracker.onPacket(1100u + 1000000000u, FRAGS_PER_FRAME);
+
+    EXPECT_EQ(tracker.stats().lostForReal, 0u) << "把一次流中断记成了十亿个丢包";
+    EXPECT_EQ(tracker.stats().givenUp, 0u);
+    EXPECT_EQ(tracker.stats().pending, 0u) << "为不存在的包登记了一整窗口的幻影缺口";
+    EXPECT_EQ(tracker.stats().discontinuities, 1u) << "重建基线必须报出来, 不能静默";
+    EXPECT_TRUE(collect(tracker).empty()) << "幻影缺口会变成一场 NACK 风暴";
+}
+
+/** 重建基线之后要能正常继续工作, 不是只把状态清了了事 */
+TEST(NackTracker, TrackingResumesNormallyAfterADiscontinuity) {
+    NackTrackerConfig cfg = config();
+    cfg.windowPackets = 256;
+    NackTracker tracker(cfg);
+
+    feedRange(tracker, 1000, 1100);
+    const uint32_t newBase = 1100u + 1000000000u;
+    tracker.onPacket(newBase, FRAGS_PER_FRAME);
+    ASSERT_EQ(tracker.stats().discontinuities, 1u);
+
+    // 新流上正常丢一个包, 应当照常被检出
+    feedRangeSkipping(tracker, newBase + 1, newBase + 1 + 2 * FRAGS_PER_FRAME,
+                      {newBase + 3});
+    const std::vector<uint32_t> targets = collect(tracker);
+    ASSERT_EQ(targets.size(), 1u) << "重建基线之后就再也不工作了";
+    EXPECT_EQ(targets[0], newBase + 3);
+}
+
+/**
+ * 边界: 跳号**恰好等于**窗口是不连续, 差一个是正常的重丢包。
+ * 这两种情况的处置完全不同(一个清账、一个记账), 分界点必须钉死。
+ */
+TEST(NackTracker, AJumpJustUnderTheWindowIsStillCountedAsLoss) {
+    NackTrackerConfig cfg = config();
+    cfg.windowPackets = 256;
+    cfg.maxRequestsPerSeq = 100;
+    NackTracker tracker(cfg);
+
+    tracker.onPacket(1000, FRAGS_PER_FRAME);
+    tracker.onPacket(1000 + 255, FRAGS_PER_FRAME);  // 跳 255 < 256
+
+    EXPECT_EQ(tracker.stats().discontinuities, 0u) << "窗口以内的跳号是真丢包, 不是换流";
+    EXPECT_GT(tracker.stats().pending + tracker.stats().lostForReal, 0u)
+        << "254 个中间的包被静默吞掉了";
+}
