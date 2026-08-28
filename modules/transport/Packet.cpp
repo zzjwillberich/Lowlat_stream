@@ -152,3 +152,51 @@ Status decodeDataHeader(const uint8_t* buf, size_t bufLen, DataHeader& out) {
 bool seqNewerThan(uint32_t a, uint32_t b) {
     return static_cast<int32_t>(a - b) > 0;
 }
+
+Status encodeNackPacket(const PacketHeader& header, const std::vector<uint32_t>& missing,
+                        uint8_t* buf, size_t bufLen, size_t& outLen) {
+    // TODO(M4.1):
+    //   1. 参数校验(全部前置, 失败时 buf 和 outLen 都不动):
+    //      buf == nullptr -> InvalidArg
+    //      missing.empty() -> InvalidArg     (空 NACK 没有意义)
+    //      header.type != PacketType::Nack -> InvalidArg
+    //        ^ 和 encodePacketHeader 查 type 是同一条理由: 本端写错时,
+    //          现象会是"对端收到 NACK 不理睬", 排查方向指向对端, bug 却在这里
+    //   2. 先按贪心分条算出需要几条, 超过 MAX_NACK_ENTRIES -> Internal
+    //      (缓冲是按线上长度算好的, 装不下只可能是本端算错了; 调用方超了应当先截断)
+    //   3. encodePacketHeader 写前 12 字节
+    //   4. 写 entryCount(2 字节, 网络序)
+    //   5. 逐条写 pid(4) + blp(2), 全部网络序
+    //   6. outLen = 12 + 2 + 6 * entryCount
+    //
+    // 贪心分条: 取第一个未覆盖的 seq 作 pid, 遍历后面的 seq, 距离 d = s - pid 落在
+    //   [1, 16] 的置进 blp 的第 (d-1) 位, 然后跳到第一个 d > 16 的 seq 作下一条的 pid。
+    //   **距离要用无符号减法算**, seq 会回绕, 直接比大小会在回绕点分错条。
+    //   不要求最优分条 —— 最优解省不下几个字节, 分条逻辑越绕越容易出错。
+    (void)header;
+    (void)missing;
+    (void)buf;
+    (void)bufLen;
+    (void)outLen;
+    return Status::error(Code::Internal, "encodeNackPacket: not implemented");
+}
+
+Status decodeNackPacket(const uint8_t* buf, size_t bufLen, std::vector<uint32_t>& out) {
+    // TODO(M4.1):
+    //   out.clear() 先做 —— 调用方复用这个 vector
+    //   1. buf == nullptr -> InvalidArg
+    //   2. decodePacketHeader 拿到头(它自己会查版本和类型合法性);
+    //      header.type != PacketType::Nack -> NetError(对端发错了, 不是本端参数错)
+    //   3. bufLen < PACKET_HEADER_SIZE + NACK_HEADER_SIZE -> NetError
+    //   4. 读 entryCount; 为 0 或 > MAX_NACK_ENTRIES -> NetError
+    //   5. **长度必须精确相符**:
+    //        bufLen != PACKET_HEADER_SIZE + NACK_HEADER_SIZE + 6 * entryCount -> NetError
+    //      多一个字节少一个字节都算畸形。拿 entryCount 去循环读数组之前必须先确认它和
+    //      实际长度相符, 否则就是一次越界读 —— UDP 上收到的每个字节都是不可信输入。
+    //   6. 逐条读 pid + blp, 展开成 seq 列表: 先 push pid, 再对 blp 的第 i 位
+    //      (i = 0..15) 为 1 的 push (pid + 1 + i)。顺序与编码时一致(从老到新)。
+    (void)buf;
+    (void)bufLen;
+    (void)out;
+    return Status::error(Code::Internal, "decodeNackPacket: not implemented");
+}

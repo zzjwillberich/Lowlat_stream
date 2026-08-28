@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <vector>
 
 #include "common/Status.h"
 
@@ -202,3 +203,82 @@ Status decodeDataHeader(const uint8_t* buf, size_t bufLen, DataHeader& out);
  * @note 只在两个 seq 相距不超过 2^31 时有意义 —— 这是所有滑动窗口协议的共同前提。
  */
 bool seqNewerThan(uint32_t a, uint32_t b);
+
+/**
+ * NACK 包的私有头, 紧跟 PacketHeader 之后, 线上 2 字节。
+ *
+ * 载荷是 entryCount 条位图条目, 每条 6 字节 (uint32 pid + uint16 blp), 形状取自
+ * RFC 4585 的 Generic NACK —— 只把 PID 从 16 位改成 32 位, 因为本协议的 seq 是 32 位。
+ */
+struct NackHeader {
+    /** @brief 位图条目数, 恒 >= 1; 一条都没有的 NACK 包没有意义, 属于畸形 */
+    uint16_t entryCount = 0;
+};
+
+/** @brief NackHeader 的线上字节数 */
+constexpr size_t NACK_HEADER_SIZE = 2;
+
+/** @brief 一条位图条目的线上字节数: uint32 pid + uint16 blp */
+constexpr size_t NACK_ENTRY_SIZE = 6;
+
+/**
+ * @brief 一条位图条目覆盖的 seq 个数: pid 自己 + blp 的 16 位
+ *
+ * @note 真实网络的丢包是**扎堆**的, 所以 6 字节管 17 个通常比列表式 4 字节管 1 个省。
+ *          但丢包**均匀分散**时它反而更费 —— 每个孤立缺口都要单独一条 6 字节。
+ *          M4 的注入器是均匀随机的, 所以在当前能测到的场景里位图比列表费 50%;
+ *          选它是因为真实网络的丢包形态, 别把"省空间"写成已验证的结论(见 [[D20]])。
+ */
+constexpr size_t NACK_SEQS_PER_ENTRY = 17;
+
+/**
+ * @brief 一个 NACK 包最多能装几条位图条目
+ *
+ * @note (1221 - 12 - 2) / 6 = 201 条, 覆盖最多 3417 个 seq。而缺口数被接收端的
+ *          跟踪窗口卡死(NackTrackerConfig::windowPackets, 默认 1024) ——
+ *          1024 个 seq 位最多需要 ceil(1024/17) = 61 条, **不管缺口怎么分布**。
+ *          所以默认配置下一个包永远装得下整个窗口, 截断路径走不到。
+ */
+constexpr size_t MAX_NACK_ENTRIES = (MAX_DATA_PACKET_SIZE - PACKET_HEADER_SIZE -
+                                     NACK_HEADER_SIZE) / NACK_ENTRY_SIZE;
+
+/**
+ * @brief 把一组缺失的 seq 编码成一个完整的 NACK 包
+ *
+ * @param header  通用包头; 调用方负责把 type 设成 PacketType::Nack
+ * @param missing 缺失的 seq, **必须已按从老到新排好序**(collectNackTargets 的输出就是)
+ * @param buf     出参缓冲, 至少 MAX_DATA_PACKET_SIZE 字节
+ * @param bufLen  缓冲长度
+ * @param outLen  出参, 实际写入的字节数
+ *
+ * @return Ok         编码成功
+ *  InvalidArg missing 为空 / header.type 不是 Nack / buf 为空
+ *  Internal   装不下 —— 缓冲是按线上长度算好的, 装不下只可能是本端算错了,
+ *                       不是坏输入。调用方超了应当**先截断再调**, 不要靠这个错误兜底
+ *
+ * @note 分条规则: 取第一个未编码的 seq 作 pid, 把它之后 16 个 seq 里也缺的置进 blp,
+ *          然后跳到下一个未覆盖的 seq。**贪心即可**, 不需要求最优分条 ——
+ *          最优解省不下几个字节, 而分条逻辑越绕越容易出错。
+ *
+ * @note seq 会回绕, "之后 16 个"要用无符号减法算距离, 不能直接比大小。
+ */
+Status encodeNackPacket(const PacketHeader& header, const std::vector<uint32_t>& missing,
+                        uint8_t* buf, size_t bufLen, size_t& outLen);
+
+/**
+ * @brief 解出一个 NACK 包里所有缺失的 seq
+ *
+ * @param buf     整包(含 PacketHeader)
+ * @param bufLen  实际收到的字节数
+ * @param out     出参, 调用前会被 clear(); 顺序与编码时一致(从老到新)
+ *
+ * @return Ok         解析成功
+ *  NetError   畸形: 版本/类型不对、长度对不上 entryCount、entryCount 为 0
+ *                       或超过 MAX_NACK_ENTRIES
+ *  InvalidArg buf 为空
+ *
+ * @note **长度必须和 entryCount 精确对得上**, 多一个字节少一个字节都算畸形。
+ *          UDP 上收到的每个字节都是不可信输入, 拿 entryCount 去循环读数组之前
+ *          必须先确认它和实际长度相符 —— 否则就是一次越界读。
+ */
+Status decodeNackPacket(const uint8_t* buf, size_t bufLen, std::vector<uint32_t>& out);
