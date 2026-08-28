@@ -5,6 +5,7 @@ add_library(lltransport STATIC
     NackTracker.cpp
     Packet.cpp
     Packetizer.cpp
+    RetransmitCache.cpp
     UdpSocket.cpp
 )
 

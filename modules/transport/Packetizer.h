@@ -109,3 +109,32 @@ private:
     uint16_t streamId_ = 0;
     uint32_t nextSeq_ = 0;
 };
+
+/**
+ * @brief 重新编出**单个**分片, 用于响应 NACK 的重传 (M4.1)
+ *
+ * @param streamId     流标识, 与原发包一致
+ * @param seq          **原发时用的那个 seq**, 不是新的
+ * @param frame        帧视图; 元信息必须与原发时完全一致
+ * @param fragIndex    该分片在帧内的序号
+ * @param fragCount    该帧共几片, 必须与原发时一致
+ * @param isRetransmit true 时置 DataHeader::FLAG_RETRANSMIT
+ * @param out          出参, 完整的一个 UDP 包
+ *
+ * @return Ok         编码成功
+ *  InvalidArg frame.data 为空 / frame.len 为 0 / fragCount 为 0 /
+ *                     fragIndex >= fragCount / 分片边界超出 frame.len
+ *
+ * @note **写成自由函数而不是成员, 是为了让"重传不推进 seq"成为结构上的保证。**
+ *          `Packetizer::packetize()` 会推进 `nextSeq_`; 重传要是复用了它,
+ *          后续原发包的 seq 就会跳号, 接收端把跳号当成丢包, 触发一轮**真正的**
+ *          NACK 风暴 —— 一次重传引发一片重传。放在类外, 它连 `nextSeq_` 都看不见。
+ *
+ * @note 编出的包必须和当初那个**逐字节相同**, 只有 flags 多一个 FLAG_RETRANSMIT。
+ *          分片边界的算法要和 packetize() 完全一致(第 i 片 = [i*MAX_PAYLOAD,
+ *          min((i+1)*MAX_PAYLOAD, len)))。两处各写一遍迟早分叉 ——
+ *          实现时让 packetize() 也走这个函数, 只留一份切片逻辑。
+ */
+Status packetizeOneFragment(uint16_t streamId, uint32_t seq, const EncodedFrameView& frame,
+                            uint16_t fragIndex, uint16_t fragCount, bool isRetransmit,
+                            PacketBuffer& out);
