@@ -288,6 +288,14 @@ public:
 
     const ReceiverPipelineStats& stats() const { return stats_; }
 
+    /**
+     * @brief M4.1 反向通道认定的对端; port 为 0 表示还没见过任何合法 DATA 包
+     *
+     * @note 和 stats() 一样, **只在 run() 返回之后读才安全**: 运行期间 peer_ 由
+     *          收包线程持续改写, 那时读它是数据竞争(UB, 不是"读到旧值")。
+     */
+    const Endpoint& peer() const { return peer_; }
+
 private:
     /** @brief 校验配置; 不碰任何资源 */
     Status validateConfig() const;
@@ -332,6 +340,30 @@ private:
      *          "FEC 恢复率"这个数就没有意义了。seq 在通用头里, 拿得到。
      */
     bool shouldInjectDrop(const uint8_t* packet, size_t len);
+
+    /**
+     * @brief M4.1: 记住"对端是谁", 供反向通道(NACK / PLI)回发
+     *
+     * @param packet 刚从 recvFrom 拿到的整包
+     * @param len    实际收到的字节数
+     * @param from   这个数据报的来源地址
+     *
+     * @note **每收到一个合法 DATA 包就无条件更新**。UDP 无连接, 绑在同一个端口上
+     *          谁都能发, 所以"对端"不是一次确定的常量, 而是一个持续跟随的量。
+     *
+     * @note 为什么不"锁定第一个不再改": 发送端每次启动的源端口都由内核随机分配
+     *          (UdpSocket::open() 不 bind), 而"接收端挂着、反复跑 sender"是调参的
+     *          标准工作流。锁死的话第二次开始 NACK 全发到一个死端口 ——
+     *          而 sendTo 到没人听的端口**不报错**(UDP 无连接), 统计里一点痕迹都没有。
+     *
+     * @note 为什么野包引不走: 30fps 下约 750 包/秒, 真流每 1.3ms 就把这个值冲刷一遍,
+     *          劫持窗口只有一个包的间隔。M4 的威胁模型里没有攻击者 —— 存心的人
+     *          直接伪造 DATA 包让画面花掉更省事, 那要靠 M5/M6 的鉴权解决, 不是这里。
+     *
+     * @note 闸门定在"合法 DATA 包": 反正取重传位就要解 DataHeader, 几乎白送;
+     *          而且它天然排除 FEC/NACK 包 —— **"对端"的定义是"给我发媒体数据的那个人"**。
+     */
+    void trackPeer(const uint8_t* packet, size_t len, const Endpoint& from);
 
     /** @brief 队列 A -> Decoder -> 队列 B */
     void decodeLoop(const std::atomic<bool>& stopRequested);
@@ -448,6 +480,19 @@ private:
 
     /** @brief 复用的收包缓冲, 每次 recvFrom 都新建一个 vector 是纯浪费 */
     std::vector<uint8_t> recvBuf_;
+
+    /**
+     * @brief M4.1 反向通道的目的地: 最后一个发来合法 DATA 包的源地址
+     *
+     * @note port 为 0 表示**还没见过任何对端**, 此时不能发 NACK/PLI ——
+     *          `Endpoint{"", 0}` 传给 sendTo 会被它的参数校验挡下来返回 InvalidArg,
+     *          但那是"本端调用错误"的语义, 不该在正常启动阶段出现。调用前先判。
+     *
+     * @note **不需要加锁**: socket 归 recvLoop 独占, 缺口也由它发现, NACK 也由它发出 ——
+     *          写和读都在同一条线程上。这是"收发共用一个 socket"直接带来的简化,
+     *          用两个 socket 反而要考虑谁来写这个变量。
+     */
+    Endpoint peer_;
 
     std::ofstream h264File_;
     ReceiverPipelineStats stats_;

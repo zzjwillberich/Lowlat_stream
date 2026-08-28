@@ -220,13 +220,18 @@ void ReceiverPipeline::recvLoop(const std::atomic<bool>& stopRequested) {
             }
         } else if (!receiveStatus.isOk()) {
             ++stats_.recvErrors;  // 单个 UDP 收包失败不终止管线
-        } else if (shouldInjectDrop(recvBuf_.data(), receivedBytes)) {
-            // 注入器判定"没收到"。lastPacketMs **照样更新** —— 包真的到了,
-            // 网络显然还活着; 不更新的话高丢包率会被 idleTimeout 误判成对端已停止。
-            lastPacketMs = now;
         } else {
+            // 包真的到了。lastPacketMs **无论注入器丢不丢它都要更新** —— 网络显然
+            // 还活着; 不更新的话高丢包率会被 idleTimeout 误判成对端已停止。
             lastPacketMs = now;
-            (void)assembler_.offer(recvBuf_.data(), receivedBytes);
+            if (!shouldInjectDrop(recvBuf_.data(), receivedBytes)) {
+                // trackPeer 放在注入器**之后**: 注入器的职责是让管线表现得像这个包
+                // 从来没到过, 那就不该从它身上学到"对端是谁"。这样"极高丢包率下
+                // 反向通道还建不建得起来"才是个能被测出来的问题, 而不是被测试工具
+                // 偷偷绕过去的问题。lastPacketMs 是唯一的例外, 理由见上。
+                trackPeer(recvBuf_.data(), receivedBytes, from);
+                (void)assembler_.offer(recvBuf_.data(), receivedBytes);
+            }
         }
 
         AssembledFrame frame;
@@ -471,6 +476,20 @@ void ReceiverPipeline::publishRecvStats() {
     shared_.renderQueueDropped = queueB_.dropped();
     shared_.decodeResyncs = decodeResyncs_.load();
     shared_.injectedDrops = injectedDrops_.load();
+}
+
+void ReceiverPipeline::trackPeer(const uint8_t* packet, size_t len, const Endpoint& from) {
+    // TODO(M4.1): 闸门定在"合法 DATA 包", 三步:
+    //   1. decodePacketHeader 失败 -> 直接返回(野包/旧版本对端, 不认它当对端)
+    //   2. header.type != PacketType::Data -> 返回
+    //      "对端"的定义是"给我发媒体数据的那个人"; 将来的 FEC/NACK 包不参与认定
+    //   3. decodeDataHeader 失败 -> 返回; 成功 -> peer_ = from
+    //
+    // 就是无条件覆盖, 不要加"只在第一次设置"或者"变了才更新"之类的条件 ——
+    // 前者会在 sender 重启后永远够不着(见头文件的 @note), 后者是同一件事写复杂了。
+    (void)packet;
+    (void)len;
+    (void)from;
 }
 
 bool ReceiverPipeline::shouldInjectDrop(const uint8_t* packet, size_t len) {

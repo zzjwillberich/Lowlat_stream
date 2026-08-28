@@ -291,3 +291,124 @@ TEST(ReceiverPipeline, CountsFramesEvenWithoutADumpFile) {
     EXPECT_EQ(pipeline.stats().framesWritten, 1u);
     EXPECT_GT(pipeline.stats().bytesWritten, 0u);
 }
+
+// ---------- M4.1 反向通道: 对端地址跟踪 ----------
+
+namespace {
+    /** 和 sendFrame 一样发一帧, 但用调用方给的 socket —— 为了控制**源端口** */
+    void sendFrameFrom(UdpSocket& sock, uint16_t port, const std::vector<uint8_t>& data,
+                       uint32_t frameId) {
+        Packetizer packer(0, frameId * 100);
+        std::vector<PacketBuffer> packets;
+        EncodedFrameView view;
+        view.data = data.data();
+        view.len = data.size();
+        view.frameId = frameId;
+        view.captureMs = 4242;
+        view.isKey = true;
+        ASSERT_TRUE(packer.packetize(view, packets).isOk());
+
+        const Endpoint to{"127.0.0.1", port};
+        for (const PacketBuffer& packet : packets) {
+            ASSERT_TRUE(sock.sendTo(to, packet.data(), packet.size()).isOk());
+        }
+    }
+
+    /** 开一个绑到随机端口的 socket, 这样源端口在发之前就是已知的 */
+    void openBound(UdpSocket& sock) {
+        ASSERT_TRUE(sock.open().isOk());
+        ASSERT_TRUE(sock.bind(Endpoint{"127.0.0.1", 0}).isOk());
+    }
+}  // namespace
+
+TEST(ReceiverPipeline, LearnsThePeerAddressFromDataPackets) {
+    ReceiverPipelineConfig cfg = receiverConfig();
+    ReceiverPipeline pipeline(cfg);
+    ASSERT_TRUE(pipeline.open().isOk());
+    EXPECT_EQ(pipeline.peer().port, 0u) << "还没收到包就认定了对端";
+    const uint16_t port = pipeline.boundPort();
+
+    std::atomic<bool> stop{false};
+    auto done = std::async(std::launch::async, [&] { return pipeline.run(stop); });
+
+    UdpSocket sender;
+    openBound(sender);
+    const uint16_t senderPort = sender.localEndpoint().port;
+    ASSERT_NE(senderPort, 0u);
+    sendFrameFrom(sender, port, fakeStream(300), 1);
+
+    ASSERT_EQ(done.wait_for(3s), std::future_status::ready);
+    ASSERT_TRUE(done.get().isOk());
+
+    EXPECT_EQ(pipeline.peer().ip, "127.0.0.1");
+    EXPECT_EQ(pipeline.peer().port, senderPort)
+        << "反向通道没有目的地, NACK 和 PLI 都发不出去";
+}
+
+/**
+ * 这条是"每个合法 DATA 包都更新"这个决定的**全部理由**。
+ *
+ * 发送端每次启动的源端口都由内核随机分配(UdpSocket::open() 不 bind), 而
+ * "接收端挂着不动、反复跑 sender"是 M4 调参的标准工作流。锁定第一个源不再改的话,
+ * 第二次开始 NACK 全发到一个死端口 —— 而 sendTo 到没人监听的端口**不报错**,
+ * 统计和日志里一点痕迹都没有, 表现为"重传怎么一次都不成功"。
+ */
+TEST(ReceiverPipeline, FollowsThePeerWhenTheSenderRestartsOnANewPort) {
+    ReceiverPipelineConfig cfg = receiverConfig();
+    ReceiverPipeline pipeline(cfg);
+    ASSERT_TRUE(pipeline.open().isOk());
+    const uint16_t port = pipeline.boundPort();
+
+    std::atomic<bool> stop{false};
+    auto done = std::async(std::launch::async, [&] { return pipeline.run(stop); });
+
+    // 第一次"运行"
+    UdpSocket first;
+    openBound(first);
+    const uint16_t firstPort = first.localEndpoint().port;
+    sendFrameFrom(first, port, fakeStream(300), 1);
+    first.close();
+
+    // 重启: 新进程 -> 新的源端口
+    UdpSocket second;
+    openBound(second);
+    const uint16_t secondPort = second.localEndpoint().port;
+    ASSERT_NE(firstPort, secondPort) << "两次拿到同一个端口, 这条用例测不到东西";
+    sendFrameFrom(second, port, fakeStream(300), 2);
+
+    ASSERT_EQ(done.wait_for(3s), std::future_status::ready);
+    ASSERT_TRUE(done.get().isOk());
+
+    EXPECT_EQ(pipeline.peer().port, secondPort)
+        << "对端锁死在第一个源上了, sender 重启之后反向通道就废了";
+}
+
+/**
+ * 闸门: 只有**合法 DATA 包**才能认定对端。
+ *
+ * 端口上收到垃圾是常态(扫描器、旧版本对端)。让随便什么包都能设定 peer_,
+ * 等于把反向通道的目的地交给任何一个往这个端口发过东西的人。
+ */
+TEST(ReceiverPipeline, GarbagePacketsDoNotBecomeThePeer) {
+    ReceiverPipelineConfig cfg = receiverConfig();
+    ReceiverPipeline pipeline(cfg);
+    ASSERT_TRUE(pipeline.open().isOk());
+    const uint16_t port = pipeline.boundPort();
+
+    std::atomic<bool> stop{false};
+    auto done = std::async(std::launch::async, [&] { return pipeline.run(stop); });
+
+    UdpSocket noise;
+    openBound(noise);
+    const std::vector<uint8_t> garbage(64, 0xEE);
+    for (int i = 0; i < 5; ++i) {
+        ASSERT_TRUE(noise.sendTo(Endpoint{"127.0.0.1", port}, garbage.data(), garbage.size())
+                        .isOk());
+    }
+
+    ASSERT_EQ(done.wait_for(3s), std::future_status::ready);
+    ASSERT_TRUE(done.get().isOk());
+
+    EXPECT_GT(pipeline.stats().assembler.packetsMalformed, 0u) << "垃圾包压根没送到";
+    EXPECT_EQ(pipeline.peer().port, 0u) << "垃圾包把反向通道的目的地设走了";
+}
