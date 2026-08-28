@@ -479,7 +479,7 @@ void ReceiverPipeline::publishRecvStats() {
 }
 
 void ReceiverPipeline::trackPeer(const uint8_t* packet, size_t len, const Endpoint& from) {
-    // TODO(M4.1): 闸门定在"合法 DATA 包", 三步:
+    // 闸门定在"合法 DATA 包", 三步:
     //   1. decodePacketHeader 失败 -> 直接返回(野包/旧版本对端, 不认它当对端)
     //   2. header.type != PacketType::Data -> 返回
     //      "对端"的定义是"给我发媒体数据的那个人"; 将来的 FEC/NACK 包不参与认定
@@ -487,9 +487,18 @@ void ReceiverPipeline::trackPeer(const uint8_t* packet, size_t len, const Endpoi
     //
     // 就是无条件覆盖, 不要加"只在第一次设置"或者"变了才更新"之类的条件 ——
     // 前者会在 sender 重启后永远够不着(见头文件的 @note), 后者是同一件事写复杂了。
-    (void)packet;
-    (void)len;
-    (void)from;
+    PacketHeader header;
+    if (!decodePacketHeader(packet, len, header).isOk()) return;
+    if (header.type != PacketType::Data) return;
+
+    DataHeader dataHeader;
+    if (!decodeDataHeader(packet + PACKET_HEADER_SIZE, len - PACKET_HEADER_SIZE,
+                          dataHeader)
+             .isOk()) {
+        return;
+    }
+
+    peer_ = from;
 }
 
 bool ReceiverPipeline::shouldInjectDrop(const uint8_t* packet, size_t len) {

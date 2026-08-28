@@ -36,6 +36,7 @@ add_unit_test(test_packetizer lltransport)     # 帧分片打包
 add_unit_test(test_frame_assembler lltransport)  # 接收端组包与丢包统计
 add_unit_test(test_jitter_buffer lltransport)    # M3.1 排序 + 按时放行 + 起播门
 add_unit_test(test_loss_injector lltransport)    # M4.0 可复现的丢包注入
+add_unit_test(test_nack_tracker lltransport)     # M4.1 缺口判定与重传请求限流
 add_unit_test(test_sender_pipeline llsender)   # M1.4 采集 -> 队列 -> 编码管线
 add_unit_test(test_receiver_pipeline llreceiver)          # M2 收包 -> 组包 -> 落盘
 add_unit_test(test_transport_loopback llsender llreceiver llcapture)  # M2 验收: 两端字节一致
