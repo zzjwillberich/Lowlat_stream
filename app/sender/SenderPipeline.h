@@ -19,6 +19,7 @@
 #include "modules/capture/ISource.h"
 #include "modules/encode/Encoder.h"
 #include "modules/transport/Packetizer.h"
+#include "modules/transport/RetransmitCache.h"
 #include "modules/transport/UdpSocket.h"
 
 /**
@@ -63,6 +64,40 @@ struct SenderPipelineConfig {
      *          本机回环发不出去只可能是自己写错了，悄悄丢包只会把 bug 藏起来。
      */
     int sendQueueCapacity = 4;
+
+    /**
+     * @brief 重传缓存的配置 (M4.1); retentionMs 为 0 表示**不启用重传**
+     *
+     * @note 关掉时不只是缓存不存, 反向通道那条 recvFrom 也不该走 ——
+     *          否则 sendLoop 每轮都要多一次 syscall 去等一个永远不会来的包。
+     *          "关掉 = 那一级完全不存在"和 target.ip 为空、renderKind 为空是同一条原则。
+     */
+    RetransmitCacheConfig retransmit;
+
+    /**
+     * @brief 反向通道每轮最多处理几个包, 0 表示不限
+     *
+     * @note 有上限是因为 sendLoop 还得发媒体数据。极端情况下(对端疯狂发 NACK、
+     *          或者有人往这个端口灌包)不设上限会让发送线程一直在收包, **媒体流饿死** ——
+     *          现象是"一开始丢包就彻底不出画了", 而根因在发送端的循环结构上。
+     *          剩下的包留在内核缓冲里, 下一轮再处理。
+     */
+    int reversePacketsPerIteration = 16;
+
+    /**
+     * @brief sendQueue_ 的等待超时(毫秒), 必须大于 0
+     *
+     * @note 这条线程要同时等两件事: 队列来帧、socket 来 NACK。而队列是条件变量、
+     *          socket 是 fd, **poll 只能等 fd, 等不了条件变量** —— 要合并只能给队列
+     *          配一个 eventfd, 那会让 BoundedQueue 从纯 C++ 容器变成绑 Linux fd 的东西,
+     *          M0 那句"只依赖 llcommon 和 libc"就破了。所以走 D16 的老办法:
+     *          带超时地等队列, 每轮顺便非阻塞地收一轮 socket。
+     *
+     * @note 但和 D16 那次不同, **这里的超时直接吃重传的时间预算**:
+     *          targetDelayMs=50、RTT=30ms 时重传预算只有约 20ms, 5ms 就吃掉四分之一。
+     *          所以给 1ms 而不是 D16 的 5ms。1000 次/秒的空转循环可以忽略。
+     */
+    int sendPollMs = 1;
 };
 
 /**
@@ -86,6 +121,32 @@ struct SenderPipelineStats {
 
     /** @brief EncodedFrame 队列的峰值长度 */
     size_t sendQueuePeak = 0;
+
+    /** @brief 收到的 NACK **包**数 (M4.1) */
+    uint64_t nacksReceived = 0;
+
+    /**
+     * @brief NACK 里请求的 seq **条目**数
+     *
+     * @note 和 nacksReceived 分开: 一个 NACK 包可以请求几百个 seq。
+     *          "收到 3 个 NACK 包"和"被请求了 300 个包"是两个完全不同的严重程度。
+     */
+    uint64_t nackedSeqs = 0;
+
+    /** @brief 实际重发出去的包数; 加上 misses 才等于 nackedSeqs */
+    uint64_t packetsRetransmitted = 0;
+
+    /**
+     * @brief 请求的 seq 已经不在重传缓存里的次数
+     *
+     * @note 稳态下应当接近 0。持续非 0 说明 retentionMs 太短, 或者接收端的重传窗口
+     *          比这边的保留时长还长 —— 两边的时间预算没对齐。这个数是唯一能区分
+     *          "NACK 没到"和"NACK 到了但这边没货"的线索, 别和 nackedSeqs 混成一个。
+     */
+    uint64_t retransmitMisses = 0;
+
+    /** @brief 反向通道上收到的畸形包数; 和 NACK 计数分开, 同 lost / malformed 的理由 */
+    uint64_t reverseMalformed = 0;
 };
 
 /**
@@ -180,6 +241,27 @@ private:
      */
     void sendLoop();
 
+    /**
+     * @brief M4.1: 收一轮反向通道上的包(NACK), 并把请求的分片重发出去
+     *
+     * @note **非阻塞**: recvFrom 用 timeoutMs = 0, 没包就立刻返回 Timeout。
+     *          这条线程的主业是发媒体, 不能在这里等。
+     *
+     * @note 每轮最多处理 config_.reversePacketsPerIteration 个包。不设上限的话,
+     *          对端疯狂发 NACK(或者有人往这个端口灌包)会让发送线程一直在收包,
+     *          **媒体流饿死** —— 现象是"一开始丢包就彻底不出画", 而根因在循环结构上。
+     *
+     * @note 重传要用 packetizeOneFragment 而不是 packetizer_.packetize():
+     *          后者会推进 nextSeq_, 后续原发包就跳号, 接收端把跳号当丢包,
+     *          触发一轮**真正的** NACK 风暴 —— 一次重传引发一片重传。
+     *          自由函数那个签名连 nextSeq_ 都碰不到, 这条是结构上保证的。
+     *
+     * @note 重发的目的地用 **NACK 包的来源地址**, 不是 config_.target:
+     *          跨 NAT 时只有"回到来源地址"的包能通(同接收端认 peer_ 的理由)。
+     *          M4 全在回环上, 两者相同 —— 但写对了就不用等到跨机器再返工。
+     */
+    void drainReverseChannel();
+
     /** @brief 写出一个编码结果并更新 encodedBytes/keyFrames */
     Status writeEncodedFrame(const EncodedFrame& frame);
 
@@ -198,6 +280,21 @@ private:
 
     /** @brief sendLoop 复用的包缓冲，跨帧复用才能让堆分配次数归零 */
     std::vector<PacketBuffer> packets_;
+
+    /**
+     * @brief M4.1 重传缓存; 只在 retransmit.retentionMs > 0 时创建
+     *
+     * @note 存的是**帧**不是打好的包。真正的理由是零拷贝而不是省内存(实测只省 1.9%):
+     *          packets_ 是跨帧复用的, 缓存整包必须每帧拷一份出来, 把上面那条
+     *          "跨帧复用让堆分配归零"废掉; 而帧本来就要在 sendLoop 末尾析构,
+     *          改成 move 进缓存一次拷贝都没有。详见 [[D23]]。
+     */
+    std::unique_ptr<RetransmitCache> retransmitCache_;
+
+    /** @brief drainReverseChannel 复用的收包缓冲和 seq 列表, 同 packets_ 的理由 */
+    std::vector<uint8_t> reverseBuf_;
+    std::vector<uint32_t> nackedSeqs_;
+    PacketBuffer retransmitBuf_;
 
     std::ofstream rawFile_;
     std::ofstream h264File_;

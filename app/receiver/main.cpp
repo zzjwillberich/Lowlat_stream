@@ -5,6 +5,7 @@
  * @date    2026-08-15
  */
 
+#include <algorithm>
 #include <atomic>
 #include <csignal>
 #include <string>
@@ -56,6 +57,11 @@ namespace {
         // 校验集中在一处, 这里只负责把命令行搬进配置。
         pipeline.loss.seed = static_cast<uint32_t>(config.getInt("seed", 0));
         pipeline.loss.lossPercent = config.getInt("loss", 0);
+
+        // M4.1 NACK。--nack-window=0 关掉整条重传请求路径。
+        pipeline.nack.windowPackets =
+            static_cast<size_t>(std::max(0, config.getInt("nack-window", 1024)));
+        pipeline.nack.maxRequestsPerSeq = config.getInt("nack-retries", 3);
         return pipeline;
     }
 }  // namespace
@@ -97,7 +103,9 @@ int main(int argc, char** argv) {
     LOG_INFO("receiver",
              "stopped: frames=%llu bytes=%llu key=%llu packets=%llu lost=%llu "
              "malformed=%llu dropped=%llu recv_errors=%llu jitter_dropped=%llu "
-             "queue_dropped=%llu resyncs=%llu injected_drops=%llu decoded=%llu "
+             "queue_dropped=%llu resyncs=%llu injected_drops=%llu "
+             "nack_sent=%llu nack_seqs=%llu nack_recovered=%llu nack_gaveup=%llu "
+             "lost_exact=%llu decoded=%llu "
              "rendered=%llu queue_peak=%zu/%zu elapsed=%llums",
              static_cast<unsigned long long>(stats.framesWritten),
              static_cast<unsigned long long>(stats.bytesWritten),
@@ -114,6 +122,11 @@ int main(int argc, char** argv) {
                                              stats.renderQueueDropped),
              static_cast<unsigned long long>(stats.decodeResyncs),
              static_cast<unsigned long long>(stats.injectedDrops),
+             static_cast<unsigned long long>(stats.nackPacketsSent),
+             static_cast<unsigned long long>(stats.nack.nacksRequested),
+             static_cast<unsigned long long>(stats.nack.recovered),
+             static_cast<unsigned long long>(stats.nack.givenUp),
+             static_cast<unsigned long long>(stats.nack.lostForReal),
              static_cast<unsigned long long>(stats.decoder.framesOut),
              static_cast<unsigned long long>(stats.renderer.framesRendered),
              stats.decodeQueuePeak, stats.renderQueuePeak,

@@ -42,6 +42,9 @@ namespace {
 
         pipeline.queueCapacity = config.getInt("cap", 4);
         pipeline.sendQueueCapacity = config.getInt("send-cap", 4);
+
+        // M4.1 重传。--retx-ms=0 关掉整条重传路径(连反向通道的 recvFrom 都不走)。
+        pipeline.retransmit.retentionMs = config.getInt("retx-ms", 200);
         pipeline.maxFrames     = config.getInt("frames", 100);
         pipeline.rawDumpPath   = config.get("dump-raw");
         pipeline.h264DumpPath  = config.get("dump");
@@ -86,13 +89,19 @@ int main(int argc, char** argv) {
     LOG_INFO("sender",
              "stopped: captured=%llu encoded=%llu bytes=%llu key=%llu "
              "queue_peak=%zu send_queue_peak=%zu packets_sent=%llu send_errors=%llu "
-             "elapsed=%llums",
+             "nacks=%llu nacked_seqs=%llu retransmitted=%llu retx_misses=%llu "
+             "reverse_malformed=%llu elapsed=%llums",
              static_cast<unsigned long long>(stats.capturedFrames),
              static_cast<unsigned long long>(stats.encodedFrames),
              static_cast<unsigned long long>(stats.encodedBytes),
              static_cast<unsigned long long>(stats.keyFrames), stats.queuePeak,
              stats.sendQueuePeak, static_cast<unsigned long long>(stats.packetsSent),
              static_cast<unsigned long long>(stats.sendErrors),
+             static_cast<unsigned long long>(stats.nacksReceived),
+             static_cast<unsigned long long>(stats.nackedSeqs),
+             static_cast<unsigned long long>(stats.packetsRetransmitted),
+             static_cast<unsigned long long>(stats.retransmitMisses),
+             static_cast<unsigned long long>(stats.reverseMalformed),
              static_cast<unsigned long long>(stats.elapsedMs));
     return 0;
 }

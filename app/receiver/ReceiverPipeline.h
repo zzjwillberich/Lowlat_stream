@@ -23,6 +23,7 @@
 #include "modules/transport/FrameAssembler.h"
 #include "modules/transport/JitterBuffer.h"
 #include "modules/transport/LossInjector.h"
+#include "modules/transport/NackTracker.h"
 #include "modules/transport/UdpSocket.h"
 
 /**
@@ -110,6 +111,14 @@ struct ReceiverPipelineConfig {
      *          说清楚 —— 一份没写明"注入了 10% 丢包"的延迟报告是有害的。
      */
     LossConfig loss;
+
+    /**
+     * @brief 缺口跟踪与重传请求 (M4.1); windowPackets 为 0 表示**不发 NACK**
+     *
+     * @note 关掉时连 NackTracker 都不喂 —— 否则每个包多一次 map 操作, 换来一堆
+     *          没人看的统计。"关掉 = 那一级完全不存在", 同 renderKind 为空。
+     */
+    NackTrackerConfig nack;
 };
 
 /**
@@ -204,6 +213,21 @@ struct ReceiverPipelineStats {
      *          被 packetsLost() 算进去。两者对不上就说明还有别的地方在丢包。
      */
     uint64_t injectedDrops = 0;
+
+    /** @brief 缺口跟踪器的计数器快照 (M4.1) */
+    NackTrackerStats nack;
+
+    /** @brief 实际发出去的 NACK **包**数; 一个包可以请求几百个 seq */
+    uint64_t nackPacketsSent = 0;
+
+    /**
+     * @brief 发 NACK 时 sendTo 失败的次数
+     *
+     * @note 单独一个字段是因为**它几乎永远是 0** —— UDP 发到没人听的端口都算成功,
+     *          所以这个数非 0 意味着 socket 本身出问题了, 和"重传没成功"是两回事。
+     *          没有它的话, "NACK 一条都没生效"会有两种原因而你分不清。
+     */
+    uint64_t nackSendErrors = 0;
 
     uint64_t elapsedMs = 0;
 };
@@ -366,6 +390,24 @@ private:
      */
     void trackPeer(const uint8_t* packet, size_t len, const Endpoint& from);
 
+    /**
+     * @brief M4.1: 把这个包喂给缺口跟踪器, 并把该请求重传的 seq 发回对端
+     *
+     * @param packet 刚收到的整包(已通过注入器)
+     * @param len    字节数
+     *
+     * @note 关掉时(config_.nack.windowPackets == 0)第一行就返回, 零开销。
+     *
+     * @note 只喂**合法 DATA 包**: 跟踪器要的是 seq 和 fragCount, 后者只有 DATA 包才有。
+     *          将来的 FEC 包虽然也占 seq 空间, 但它丢了不该请求重传 ——
+     *          FEC 本来就是"丢了也不要紧"的那一份冗余。
+     *
+     * @note 发 NACK 之前必须确认 `peer_.port != 0`。没见过对端就发, sendTo 会因为
+     *          Endpoint{"", 0} 返回 InvalidArg —— 那是"本端调用错误"的语义,
+     *          不该在正常启动阶段出现。
+     */
+    void requestRetransmissions(const uint8_t* packet, size_t len);
+
     /** @brief 队列 A -> Decoder -> 队列 B */
     void decodeLoop(const std::atomic<bool>& stopRequested);
 
@@ -494,6 +536,25 @@ private:
      *          用两个 socket 反而要考虑谁来写这个变量。
      */
     Endpoint peer_;
+
+    /** @brief M4.1 缺口跟踪器; 收包线程独占, 不需要加锁 */
+    NackTracker nackTracker_;
+
+    /** @brief 复用的 NACK 发送缓冲和 seq 列表, 同 recvBuf_ 的理由 */
+    std::vector<uint32_t> nackTargets_;
+    std::vector<uint8_t> nackBuf_;
+
+    /**
+     * @brief 本端发出的 NACK 用的 seq 计数器
+     *
+     * @note **和 DATA 的 seq 空间无关**, 两个方向各数各的 —— 反向通道的包
+     *          不该占用媒体流的序号, 否则发送端的丢包统计会被自己发的 NACK 搅乱。
+     */
+    uint32_t nackSeq_ = 0;
+
+    /** @brief M4.1 统计, 收包线程独占写 */
+    std::atomic<uint64_t> nackPacketsSent_{0};
+    std::atomic<uint64_t> nackSendErrors_{0};
 
     std::ofstream h264File_;
     ReceiverPipelineStats stats_;

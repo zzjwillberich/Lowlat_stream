@@ -37,7 +37,8 @@ ReceiverPipeline::ReceiverPipeline(ReceiverPipelineConfig config)
       // BoundedQueue 在构造时 assert 容量。将非法的 0 暂钳成 1，让 open() 能返回
       // 可诊断的 InvalidArg，而不是在构造阶段中止进程。
       queueA_(std::max<size_t>(1, config_.decodeQueueCapacity)),
-      queueB_(std::max<size_t>(1, config_.renderQueueCapacity)) {}
+      queueB_(std::max<size_t>(1, config_.renderQueueCapacity)),
+      nackTracker_(config_.nack) {}
 
 Status ReceiverPipeline::open() {
     Status status = validateConfig();
@@ -169,6 +170,17 @@ Status ReceiverPipeline::validateConfig() const {
         return Status::error(Code::InvalidArg,
                              "ReceiverPipeline: --seed is required when --loss is positive");
     }
+    // TODO(M4.1): NACK 相关的校验
+    //   windowPackets == 0 表示"不发 NACK", 是合法的关闭方式;
+    //   但 windowPackets > 0 时下面几个必须站得住:
+    //     maxRequestsPerSeq <= 0     -> InvalidArg (0 次请求 = 缺口一出现就判死, 没有意义)
+    //     minReorderPackets == 0     -> InvalidArg (容忍为 0 等于把每次乱序都当丢包)
+    //     maxReorderPackets < minReorderPackets -> InvalidArg
+    //
+    //   注意 windowPackets == 0 现在会让 NackTracker 把**每一次跳号**都当成流不连续
+    //   (forwardDistance >= 0 恒成立), discontinuities 狂涨而 NACK 完全不工作。
+    //   那是静默空转, 和"给了 --loss 没给 --seed"同一族 —— 所以要么在这里挡掉, 要么
+    //   在 open() 里干脆不喂跟踪器。选后者的话这条校验就不需要, 但得确保真的不喂。
     return Status::ok();
 }
 
@@ -230,6 +242,7 @@ void ReceiverPipeline::recvLoop(const std::atomic<bool>& stopRequested) {
                 // 反向通道还建不建得起来"才是个能被测出来的问题, 而不是被测试工具
                 // 偷偷绕过去的问题。lastPacketMs 是唯一的例外, 理由见上。
                 trackPeer(recvBuf_.data(), receivedBytes, from);
+                requestRetransmissions(recvBuf_.data(), receivedBytes);
                 (void)assembler_.offer(recvBuf_.data(), receivedBytes);
             }
         }
@@ -476,6 +489,9 @@ void ReceiverPipeline::publishRecvStats() {
     shared_.renderQueueDropped = queueB_.dropped();
     shared_.decodeResyncs = decodeResyncs_.load();
     shared_.injectedDrops = injectedDrops_.load();
+    shared_.nack = nackTracker_.stats();
+    shared_.nackPacketsSent = nackPacketsSent_.load();
+    shared_.nackSendErrors = nackSendErrors_.load();
 }
 
 void ReceiverPipeline::trackPeer(const uint8_t* packet, size_t len, const Endpoint& from) {
@@ -498,7 +514,39 @@ void ReceiverPipeline::trackPeer(const uint8_t* packet, size_t len, const Endpoi
         return;
     }
 
+    // TODO(M4.1): 对端换了就 nackTracker_.reset()。
+    //   sender 每次启动的源端口由内核随机分配, 而 Packetizer 的 initialSeq 默认 0 ——
+    //   也就是重启后 seq 从头开始。跟踪器里的 highestSeq_ 还停在旧流的位置,
+    //   新流的包全部被判成"迟到包"忽略, **一个 NACK 都不会发**。
+    //   盲区长度 = 旧的 highestSeq_ 个包: 刚跑过 100 帧是 4.7 秒,
+    //   接收端挂了一小时就是一个多小时。
+    //   判据是 peer_ 变了(ip 或 port 任一不同), 不是"第一次设置"。
+    //   Endpoint 现在没有 operator==, 逐字段比就行, 别为这一处加运算符。
     peer_ = from;
+}
+
+void ReceiverPipeline::requestRetransmissions(const uint8_t* packet, size_t len) {
+    // TODO(M4.1):
+    //   1. config_.nack.windowPackets == 0 -> return  (关掉时零开销, 放第一行)
+    //   2. 解 PacketHeader + DataHeader; 不是合法 DATA 包 -> return
+    //      (FEC 包也占 seq 空间, 但它丢了不该请求重传 —— 冗余包本来就是"丢了不要紧"的)
+    //   3. nackTracker_.onPacket(header.seq, dataHeader.fragCount)
+    //   4. nackTracker_.collectNackTargets(nackTargets_); 空 -> return
+    //   5. peer_.port == 0 -> return
+    //      还没见过对端就发, sendTo 会因 Endpoint{"", 0} 返回 InvalidArg ——
+    //      那是"本端调用错误"的语义, 不该在正常启动阶段出现
+    //   6. 组包: PacketHeader{type = Nack, streamId = 0, seq = nackSeq_++,
+    //            timestampMs = static_cast<uint32_t>(steadyNowMs())}
+    //      **nackSeq_ 和 DATA 的 seq 空间无关**, 两个方向各数各的
+    //   7. encodeNackPacket(...) -> socket_.sendTo(peer_, ...)
+    //      成功 -> ++nackPacketsSent_; 失败 -> ++nackSendErrors_
+    //
+    // 截断: nackTargets_ 超过一个包装得下的量时**只发前面一批**, 剩下的留到下一轮
+    //   (collectNackTargets 自己有限流, 下一轮很快)。不过按默认配置这条走不到 ——
+    //   一个 NACK 包装得下整个 1024 的跟踪窗口, 见 Packet.h 的 MAX_NACK_ENTRIES。
+    //   走到了就是配置被改大了, encodeNackPacket 会返回 Internal 提醒你。
+    (void)packet;
+    (void)len;
 }
 
 bool ReceiverPipeline::shouldInjectDrop(const uint8_t* packet, size_t len) {

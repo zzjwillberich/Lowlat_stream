@@ -33,7 +33,8 @@ namespace {
             || key == "render" || key == "jitter-ms" || key == "vsync"
             || key == "threads" || key == "stats-interval"
             // M4 弱网对抗参数
-            || key == "loss" || key == "seed";
+            || key == "loss" || key == "seed"
+            || key == "nack-window" || key == "nack-retries" || key == "retx-ms";
     }
 }
 
@@ -223,5 +224,11 @@ void Config::printUsage() const {
         "  --loss <percent>      Inject packet loss, 0-100; 0 disables (default: 0)\n"
         "  --seed <n>            PRNG seed for --loss; 0 disables injection (default: 0)\n"
         "                        Same seed drops the same packets on every run.\n"
+        "NACK / retransmission (M4):\n"
+        "  --nack-window <n>     Receiver gap-tracking window in packets;\n"
+        "                        0 disables NACK entirely (default: 1024)\n"
+        "  --nack-retries <n>    Max NACK requests per lost packet (default: 3)\n"
+        "  --retx-ms <ms>        Sender retransmit cache retention;\n"
+        "                        0 disables retransmission (default: 200)\n"
     );
 }
