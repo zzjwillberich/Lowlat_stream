@@ -52,12 +52,19 @@ void NackTracker::onPacket(uint32_t seq, uint16_t fragCount) {
 
     const uint32_t forwardDistance = seq - highestSeq_;
 
-    // TODO(M4.1): 跳号超过一整个窗口 -> 按"换了一条流"处理:
+    // 跳号超过一整个窗口 -> 按"换了一条流"处理:
     //   gaps_.clear(); highestSeq_ = seq; ++stats_.discontinuities; stats_.pending = 0;
     //   然后直接 return —— 不登记任何缺口, 也不计 givenUp / lostForReal。
     //   理由见头文件 onPacket 的 @note: seq 是包头里唯一没有校验的字段,
     //   forwardDistance 的上界是 2^31, 一个坏包就能把 lostForReal 加十亿并制造
     //   一整窗口的幻影缺口。
+    if (static_cast<uint64_t>(forwardDistance) >= config_.windowPackets) {
+        gaps_.clear();
+        highestSeq_ = seq;
+        ++stats_.discontinuities;
+        stats_.pending = 0;
+        return;
+    }
 
     highestSeq_ = seq;
 
