@@ -161,13 +161,14 @@ Status ReceiverPipeline::validateConfig() const {
         return Status::error(Code::InvalidArg,
                              "ReceiverPipeline: renderer dimensions must be positive");
     }
-    // TODO(M4.0): 丢包注入的三条校验。
-    //   1. lossPercent 必须落在 [0, 100];
-    //   2. lossPercent > 0 但 seed == LOSS_SEED_DISABLED -> **报错退出**。
-    //      这个组合是静默空转: 你以为测了 N% 丢包, 其实一个包都没丢。测试工具最不该
-    //      有的就是这个 —— 宁可吵, 不可静。错误消息要点名缺的是 --seed。
-    //   3. seed 给了但 lossPercent == 0 是**合法**的(注入器关着), 不用报错 ——
-    //      脚本里把 --seed 固定写死、只调 --loss 是正常用法。
+    if (config_.loss.lossPercent < 0 || config_.loss.lossPercent > 100) {
+        return Status::error(Code::InvalidArg,
+                             "ReceiverPipeline: --loss must be in [0, 100]");
+    }
+    if (config_.loss.lossPercent > 0 && config_.loss.seed == LOSS_SEED_DISABLED) {
+        return Status::error(Code::InvalidArg,
+                             "ReceiverPipeline: --seed is required when --loss is positive");
+    }
     return Status::ok();
 }
 
@@ -473,7 +474,7 @@ void ReceiverPipeline::publishRecvStats() {
 }
 
 bool ReceiverPipeline::shouldInjectDrop(const uint8_t* packet, size_t len) {
-    // TODO(M4.0):
+    // 丢包注入必须保持以下顺序:
     //   1. !lossInjectionEnabled(config_.loss) -> return false  (关掉时零开销, 放第一行)
     //   2. decodePacketHeader 失败 -> return false
     //      **不是** return true —— 畸形包要交给 offer() 去计 packetsMalformed,
@@ -484,9 +485,25 @@ bool ReceiverPipeline::shouldInjectDrop(const uint8_t* packet, size_t len) {
     //      - DATA 包的 DataHeader 解不出来 -> 同第 2 条, return false
     //   4. shouldDropPacket(config_.loss, header.seq, isRetransmit);
     //      为 true 时 ++injectedDrops_ 再 return true
-    (void)packet;
-    (void)len;
-    return false;
+    if (!lossInjectionEnabled(config_.loss)) return false;
+
+    PacketHeader header;
+    if (!decodePacketHeader(packet, len, header).isOk()) return false;
+
+    bool isRetransmit = false;
+    if (header.type == PacketType::Data) {
+        DataHeader dataHeader;
+        if (!decodeDataHeader(packet + PACKET_HEADER_SIZE, len - PACKET_HEADER_SIZE,
+                              dataHeader)
+                 .isOk()) {
+            return false;
+        }
+        isRetransmit = (dataHeader.flags & DataHeader::FLAG_RETRANSMIT) != 0;
+    }
+
+    if (!shouldDropPacket(config_.loss, header.seq, isRetransmit)) return false;
+    ++injectedDrops_;
+    return true;
 }
 
 void ReceiverPipeline::publishDecodeStats() {

@@ -71,6 +71,7 @@ int main(int argc, char** argv) {
     bool configOk = false;
     ReceiverPipelineConfig pipelineConfig = makeReceiverConfig(config, configOk);
     if (!configOk) return 1;
+    const LossConfig lossConfig = pipelineConfig.loss;
 
     std::signal(SIGINT, onSignal);
     std::signal(SIGTERM, onSignal);
@@ -85,10 +86,10 @@ int main(int argc, char** argv) {
     LOG_INFO("receiver", "listening on port %u",
              static_cast<unsigned>(pipeline.boundPort()));
 
-    // TODO(M4.0): 注入器开着的时候必须在这里打一行 WARN, 写明 loss% 和 seed。
-    //   一份没写明"注入了 N% 丢包"的延迟报告是有害的 —— 看报告的人(包括三个月后
-    //   的你自己)会把注入的丢包当成真实网络表现。用 WARN 不用 INFO: 它不是常规
-    //   运行状态, 应该显眼。
+    if (lossInjectionEnabled(lossConfig)) {
+        LOG_WARN("receiver", "loss injection enabled: loss=%d%% seed=%u",
+                 lossConfig.lossPercent, static_cast<unsigned>(lossConfig.seed));
+    }
 
     status = pipeline.run(gStopRequested);
 

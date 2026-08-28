@@ -277,3 +277,163 @@ TEST(ReceiverE2E, UnknownRenderKindFailsAtOpen) {
  * M6 要把指标推给 Redis / HTTP API 时必须补这个口子; 补上之后这条用例可以改成
  * 轮询"已收到第一帧"再触发停止, 从"靠等"变成"可等待的确定时刻"。
  */
+
+// ---------- M4.0 丢包注入 ----------
+
+/**
+ * 注入器接进管线之后，端到端还必须是可复现的。
+ *
+ * 自由函数的纯函数性质在 test_loss_injector.cpp 里已经钉住了，但那和"接进管线之后
+ * 还可复现"**不是一回事** —— 中间隔着 UDP 的到达顺序、recvFrom 的内核缓冲、
+ * FrameAssembler 的状态。这条不成立的话，后面每一次「改了 FEC，看恢复率有没有变好」
+ * 的对比结论都是悬空的：你分不清数字变了是因为代码改好了，还是因为这次丢的不是同一批包。
+ */
+TEST(ReceiverE2E, TheSameSeedDropsExactlyTheSamePackets) {
+    constexpr int FRAMES = 40;
+    constexpr uint32_t SEED = 20260828;
+
+    // 同一份配置跑两遍，除了内核分配的端口不同，其它完全一致
+    auto runOnce = [](uint32_t seed) {
+        ReceiverPipelineConfig cfg = receiverConfig();
+        cfg.idleTimeoutMs = 400;
+        cfg.loss.seed = seed;
+        cfg.loss.lossPercent = 30;
+        // 起播门会让丢掉 IDR 的那一段完全不出帧，那是正常行为；这条用例只看
+        // 收包这一级的计数，所以不需要关掉它。
+        ReceiverPipeline receiver(cfg);
+        EXPECT_TRUE(receiver.open().isOk());
+
+        std::atomic<bool> recvStop{false};
+        auto recvDone = std::async(std::launch::async, [&] { return receiver.run(recvStop); });
+
+        SenderPipeline sender(std::make_unique<NullSource>(),
+                              senderConfig(receiver.boundPort(), FRAMES));
+        std::atomic<bool> sendStop{false};
+        EXPECT_TRUE(sender.run(sendStop).isOk());
+
+        EXPECT_EQ(recvDone.wait_for(10s), std::future_status::ready);
+        EXPECT_TRUE(recvDone.get().isOk());
+        return receiver.stats();
+    };
+
+    const ReceiverPipelineStats a = runOnce(SEED);
+    const ReceiverPipelineStats b = runOnce(SEED);
+
+    ASSERT_GT(a.injectedDrops, 0u) << "30% 丢包一个都没丢 —— 注入器根本没接上";
+    // 发送端每次编出来的字节数一样，所以包数也一样；包数一样 + 种子一样
+    // => 丢的必须是同一批包，一个不差
+    EXPECT_EQ(a.assembler.packetsReceived + a.injectedDrops,
+              b.assembler.packetsReceived + b.injectedDrops)
+        << "两次收到的包总数就不一样, 后面的比较没有意义";
+    EXPECT_EQ(a.injectedDrops, b.injectedDrops)
+        << "同一个种子跑两遍丢的包数不同 —— 可复现性在管线这一级失效了";
+    EXPECT_EQ(a.assembler.packetsReceived, b.assembler.packetsReceived);
+}
+
+/**
+ * 换种子必须换一批包。
+ *
+ * 丢的**数量**会接近(都是 30%)，所以数量相等不能作为判据；这里比的是
+ * "组包器实际收到了哪些"的下游后果 —— 完整帧数。同样的丢包率下，
+ * 丢在不同位置，能拼齐的帧就不同。
+ */
+TEST(ReceiverE2E, ADifferentSeedDropsADifferentSetOfPackets) {
+    constexpr int FRAMES = 40;
+
+    auto runWithSeed = [](uint32_t seed) {
+        ReceiverPipelineConfig cfg = receiverConfig();
+        cfg.idleTimeoutMs = 400;
+        cfg.loss.seed = seed;
+        cfg.loss.lossPercent = 30;
+        ReceiverPipeline receiver(cfg);
+        EXPECT_TRUE(receiver.open().isOk());
+
+        std::atomic<bool> recvStop{false};
+        auto recvDone = std::async(std::launch::async, [&] { return receiver.run(recvStop); });
+        SenderPipeline sender(std::make_unique<NullSource>(),
+                              senderConfig(receiver.boundPort(), FRAMES));
+        std::atomic<bool> sendStop{false};
+        EXPECT_TRUE(sender.run(sendStop).isOk());
+        EXPECT_EQ(recvDone.wait_for(10s), std::future_status::ready);
+        EXPECT_TRUE(recvDone.get().isOk());
+        return receiver.stats();
+    };
+
+    const ReceiverPipelineStats a = runWithSeed(11111);
+    const ReceiverPipelineStats b = runWithSeed(99999);
+
+    ASSERT_GT(a.injectedDrops, 0u);
+    ASSERT_GT(b.injectedDrops, 0u);
+    // 两个种子丢掉同样多的包、又拼出同样多的完整帧, 概率极低 ——
+    // 真出现了, 第一个要怀疑的是 seed 根本没参与混合
+    EXPECT_FALSE(a.injectedDrops == b.injectedDrops &&
+                 a.framesWritten == b.framesWritten)
+        << "换了种子, 丢包数和成帧数都一模一样 —— seed 大概率没起作用";
+}
+
+/**
+ * 注入器开着的时候，畸形包统计不能被它吃掉。
+ *
+ * 注入器为了拿 seq 会先解一次包头。解不出来的包必须**原样交给** FrameAssembler ——
+ * 在注入器这一层就丢掉的话，packetsMalformed 恒为 0，而那是排查"对端在乱发还是
+ * 版本对不上"的唯一线索。测试工具吃掉诊断信息，比测试工具本身出错更难查。
+ */
+TEST(ReceiverE2E, InjectionDoesNotSwallowMalformedPackets) {
+    ReceiverPipelineConfig cfg = receiverConfig("");  // 纯落盘, 不需要解码渲染
+    cfg.idleTimeoutMs = 400;
+    cfg.loss.seed = 4242;
+    cfg.loss.lossPercent = 50;  // 一半的合法包会被丢, 垃圾包一个都不该被丢
+    ReceiverPipeline receiver(cfg);
+    ASSERT_TRUE(receiver.open().isOk());
+    const uint16_t port = receiver.boundPort();
+
+    std::atomic<bool> recvStop{false};
+    auto recvDone = std::async(std::launch::async, [&] { return receiver.run(recvStop); });
+
+    // 版本号和类型都不认识的垃圾, decodePacketHeader 必然失败
+    UdpSocket sock;
+    ASSERT_TRUE(sock.open().isOk());
+    const std::vector<uint8_t> garbage(64, 0xEE);
+    for (int i = 0; i < 20; ++i) {
+        ASSERT_TRUE(sock.sendTo(Endpoint{"127.0.0.1", port}, garbage.data(), garbage.size()).isOk());
+    }
+
+    ASSERT_EQ(recvDone.wait_for(10s), std::future_status::ready);
+    EXPECT_TRUE(recvDone.get().isOk());
+
+    const ReceiverPipelineStats& rs = receiver.stats();
+    EXPECT_EQ(rs.injectedDrops, 0u) << "解不出包头的包不该由注入器处置";
+    EXPECT_EQ(rs.assembler.packetsMalformed, 20u)
+        << "畸形包被注入器吃掉了 —— 诊断信息没了";
+}
+
+/**
+ * --loss 给了但 --seed 没给，必须在 open() 就报错。
+ *
+ * 这个组合会静默空转: 你以为测了 N% 丢包, 其实一个包都没丢, 然后得出
+ * "弱网下表现很好"的结论。测试工具最不该有的就是这个 —— 宁可吵, 不可静。
+ */
+TEST(ReceiverE2E, LossWithoutASeedIsRejectedAtOpen) {
+    {
+        ReceiverPipelineConfig cfg = receiverConfig();
+        cfg.loss.lossPercent = 10;
+        cfg.loss.seed = LOSS_SEED_DISABLED;
+        ReceiverPipeline receiver(cfg);
+        EXPECT_EQ(receiver.open().code(), Code::InvalidArg);
+    }
+    {   // 反过来是合法的: 种子给了、丢包率为 0 = 注入器关着
+        ReceiverPipelineConfig cfg = receiverConfig();
+        cfg.loss.lossPercent = 0;
+        cfg.loss.seed = 12345;
+        ReceiverPipeline receiver(cfg);
+        EXPECT_TRUE(receiver.open().isOk())
+            << "脚本里把 --seed 写死、只调 --loss 是正常用法";
+    }
+    {
+        ReceiverPipelineConfig cfg = receiverConfig();
+        cfg.loss.lossPercent = 101;
+        cfg.loss.seed = 12345;
+        ReceiverPipeline receiver(cfg);
+        EXPECT_EQ(receiver.open().code(), Code::InvalidArg);
+    }
+}

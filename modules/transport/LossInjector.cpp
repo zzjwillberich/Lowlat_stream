@@ -7,13 +7,12 @@
 #include "modules/transport/LossInjector.h"
 
 bool lossInjectionEnabled(const LossConfig& config) {
-    // TODO(M4.0): seed 不是哨兵, 且 lossPercent 落在 (0, 100] 内才算开启。
-    (void)config;
-    return false;
+    return config.seed != LOSS_SEED_DISABLED && config.lossPercent > 0 &&
+           config.lossPercent <= 100;
 }
 
 bool shouldDropPacket(const LossConfig& config, uint32_t seq, bool isRetransmit) {
-    // TODO(M4.0): 按以下顺序判断, 顺序本身是契约的一部分 ——
+    // 按以下顺序判断, 顺序本身是契约的一部分 ——
     //   1. 没开启 -> false
     //   2. isRetransmit -> false   (在算哈希之前就短路, 见头文件的理由)
     //   3. lossPercent >= 100 -> true
@@ -28,8 +27,16 @@ bool shouldDropPacket(const LossConfig& config, uint32_t seq, bool isRetransmit)
     //
     // 现成的选择: 32 位版 splitmix / murmur3 的 finalizer(几行位运算, 无依赖),
     // 把 seed 和 seq 先混进一个 uint64 再 finalize。别自己发明。
-    (void)config;
-    (void)seq;
-    (void)isRetransmit;
-    return false;
+    if (!lossInjectionEnabled(config)) return false;
+    if (isRetransmit) return false;
+    if (config.lossPercent >= 100) return true;
+
+    uint64_t mixed = (static_cast<uint64_t>(config.seed) << 32) | seq;
+    mixed += 0x9E3779B97F4A7C15ull;
+    mixed = (mixed ^ (mixed >> 30)) * 0xBF58476D1CE4E5B9ull;
+    mixed = (mixed ^ (mixed >> 27)) * 0x94D049BB133111EBull;
+    mixed ^= mixed >> 31;
+
+    const uint32_t hash = static_cast<uint32_t>(mixed ^ (mixed >> 32));
+    return hash % 100u < static_cast<uint32_t>(config.lossPercent);
 }
