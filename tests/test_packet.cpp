@@ -148,6 +148,51 @@ TEST(DataHeader, RoundTripPreservesEveryField) {
     EXPECT_EQ(out.flags, in.flags);
 }
 
+/**
+ * M4 给 flags 加了 bit1(重传)。两个位必须能独立设置、独立读回 ——
+ * 用 == FLAG_KEYFRAME 而不是 & 去判关键帧的写法, 会在重传的 IDR 分片上判错。
+ */
+TEST(DataHeader, KeyframeAndRetransmitFlagsAreIndependent) {
+    const uint8_t combos[] = {
+        0,
+        DataHeader::FLAG_KEYFRAME,
+        DataHeader::FLAG_RETRANSMIT,
+        static_cast<uint8_t>(DataHeader::FLAG_KEYFRAME | DataHeader::FLAG_RETRANSMIT),
+    };
+    for (uint8_t flags : combos) {
+        DataHeader in = sampleDataHeader();
+        in.flags = flags;
+
+        std::vector<uint8_t> buf(DATA_HEADER_SIZE);
+        ASSERT_TRUE(encodeDataHeader(in, buf.data(), buf.size()).isOk());
+        EXPECT_EQ(buf[8], flags) << "flags 就在偏移 8, 一个字节原样上网";
+
+        DataHeader out;
+        ASSERT_TRUE(decodeDataHeader(buf.data(), buf.size(), out).isOk());
+        EXPECT_EQ(out.flags, flags);
+        EXPECT_EQ((out.flags & DataHeader::FLAG_KEYFRAME) != 0,
+                  (flags & DataHeader::FLAG_KEYFRAME) != 0);
+        EXPECT_EQ((out.flags & DataHeader::FLAG_RETRANSMIT) != 0,
+                  (flags & DataHeader::FLAG_RETRANSMIT) != 0);
+    }
+}
+
+/**
+ * bit2~7 是给以后留的扩展位。老接收端遇到新发送端时必须**忽略**不认识的位,
+ * 不能把整个包判成畸形 —— 那会让协议再也没法往前兼容地加东西。
+ */
+TEST(DataHeader, ReservedFlagBitsAreNotRejected) {
+    DataHeader in = sampleDataHeader();
+    in.flags = 0xFF;
+
+    std::vector<uint8_t> buf(DATA_HEADER_SIZE);
+    ASSERT_TRUE(encodeDataHeader(in, buf.data(), buf.size()).isOk());
+
+    DataHeader out;
+    EXPECT_TRUE(decodeDataHeader(buf.data(), buf.size(), out).isOk());
+    EXPECT_EQ(out.flags, 0xFF);
+}
+
 TEST(DataHeader, SingleFragmentFrameIsValid) {
     DataHeader in = sampleDataHeader();
     in.fragIndex = 0;

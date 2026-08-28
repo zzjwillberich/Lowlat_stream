@@ -22,6 +22,7 @@
 #include "modules/render/IRenderer.h"
 #include "modules/transport/FrameAssembler.h"
 #include "modules/transport/JitterBuffer.h"
+#include "modules/transport/LossInjector.h"
 #include "modules/transport/UdpSocket.h"
 
 /**
@@ -97,6 +98,18 @@ struct ReceiverPipelineConfig {
      *          1800 行, 而且格式化本身就会污染你要测的那个延迟(NOTES D1)。
      */
     int statsIntervalMs = 1000;
+
+    /**
+     * @brief M4.0 丢包注入; 默认关闭(seed 为哨兵)
+     *
+     * @note 放在**接收端**而不是发送端: 真实丢包发生在传输途中, 发送端照常发出去了,
+     *          是接收端没收到。放在这一侧还有个附带好处 —— 包真的上了网线、真的过了
+     *          内核, 网络路径上的时序一点没变, 不像发送端跳过 sendTo 会省掉一次系统调用。
+     *
+     * @note **它是测试工具, 不是业务功能**: 默认必须完全不生效, 且开启时要在日志里
+     *          说清楚 —— 一份没写明"注入了 10% 丢包"的延迟报告是有害的。
+     */
+    LossConfig loss;
 };
 
 /**
@@ -177,6 +190,20 @@ struct ReceiverPipelineStats {
 
     /** @brief 队列 A 满而调用 dropUntilKeyFrame() 的次数；一次意味着最长一个 GOP 的冻结 */
     uint64_t decodeResyncs = 0;
+
+    /**
+     * @brief 被**丢包注入器**扔掉的包数 (M4.0)
+     *
+     * @note 必须和 assembler.packetsLost() 分开报, 理由和 lost / malformed 分开
+     *          是同一条: 前者是**我们自己造的**, 后者是网络造的。混成一个数,
+     *          "这次丢包率高"就分不清是网络差还是注入器开着 ——
+     *          而注入器开着是最容易忘的一件事。
+     *
+     * @note 这个数和 packetsLost() 在稳态下应当**接近但不相等**:
+     *          注入器丢的包 assembler 从来没见过, 所以它会体现在 seq 缺口里,
+     *          被 packetsLost() 算进去。两者对不上就说明还有别的地方在丢包。
+     */
+    uint64_t injectedDrops = 0;
 
     uint64_t elapsedMs = 0;
 };
@@ -284,6 +311,28 @@ private:
      */
     void recvLoop(const std::atomic<bool>& stopRequested);
 
+    /**
+     * @brief M4.0: 这个刚收到的包该不该被注入器"丢掉"
+     *
+     * @param packet 刚从 recvFrom 拿到的整包(含包头)
+     * @param len    实际收到的字节数
+     *
+     * @return true 表示调用方应当**当作没收到**: 直接 continue, 不要 offer 给组包器
+     *
+     * @note 注入器要 seq, 所以这里得先解一次包头 —— offer() 里还会再解一次。
+     *          多解一次是纳秒级的, 而且 lossInjectionEnabled() 为 false 时这个函数
+     *          第一行就返回, 关掉注入时开销是零。别为了省这一次解析把注入逻辑
+     *          塞进 FrameAssembler —— 那会把测试工具焊进业务模块。
+     *
+     * @note **解包头失败的包必须返回 false**(照常交给 offer)。畸形包要由组包器
+     *          计进 packetsMalformed; 在这一层就丢掉的话, 测试工具会把畸形包统计
+     *          吃掉, 而那正是排查"对端在乱发还是版本不匹配"的唯一线索。
+     *
+     * @note 非 DATA 包(将来的 FEC)也要按 seq 判丢 —— FEC 包不能丢的话,
+     *          "FEC 恢复率"这个数就没有意义了。seq 在通用头里, 拿得到。
+     */
+    bool shouldInjectDrop(const uint8_t* packet, size_t len);
+
     /** @brief 队列 A -> Decoder -> 队列 B */
     void decodeLoop(const std::atomic<bool>& stopRequested);
 
@@ -388,6 +437,14 @@ private:
 
     /** @brief 队列 A 保险丝触发次数；收包线程写、渲染线程读取统计快照 */
     std::atomic<uint64_t> decodeResyncs_{0};
+
+    /**
+     * @brief M4.0 注入器扔掉的包数；收包线程独占写
+     *
+     * @note 用 atomic 是为了跟着上面两个走同一条发布路径(publishRecvStats 拷进 shared_),
+     *          不是因为有竞争 —— 只有收包线程写它。
+     */
+    std::atomic<uint64_t> injectedDrops_{0};
 
     /** @brief 复用的收包缓冲, 每次 recvFrom 都新建一个 vector 是纯浪费 */
     std::vector<uint8_t> recvBuf_;

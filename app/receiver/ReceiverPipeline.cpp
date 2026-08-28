@@ -161,6 +161,13 @@ Status ReceiverPipeline::validateConfig() const {
         return Status::error(Code::InvalidArg,
                              "ReceiverPipeline: renderer dimensions must be positive");
     }
+    // TODO(M4.0): 丢包注入的三条校验。
+    //   1. lossPercent 必须落在 [0, 100];
+    //   2. lossPercent > 0 但 seed == LOSS_SEED_DISABLED -> **报错退出**。
+    //      这个组合是静默空转: 你以为测了 N% 丢包, 其实一个包都没丢。测试工具最不该
+    //      有的就是这个 —— 宁可吵, 不可静。错误消息要点名缺的是 --seed。
+    //   3. seed 给了但 lossPercent == 0 是**合法**的(注入器关着), 不用报错 ——
+    //      脚本里把 --seed 固定写死、只调 --loss 是正常用法。
     return Status::ok();
 }
 
@@ -212,6 +219,10 @@ void ReceiverPipeline::recvLoop(const std::atomic<bool>& stopRequested) {
             }
         } else if (!receiveStatus.isOk()) {
             ++stats_.recvErrors;  // 单个 UDP 收包失败不终止管线
+        } else if (shouldInjectDrop(recvBuf_.data(), receivedBytes)) {
+            // 注入器判定"没收到"。lastPacketMs **照样更新** —— 包真的到了,
+            // 网络显然还活着; 不更新的话高丢包率会被 idleTimeout 误判成对端已停止。
+            lastPacketMs = now;
         } else {
             lastPacketMs = now;
             (void)assembler_.offer(recvBuf_.data(), receivedBytes);
@@ -458,6 +469,24 @@ void ReceiverPipeline::publishRecvStats() {
     shared_.decodeQueueDropped = queueA_.dropped() + decodeQueueRejected_.load();
     shared_.renderQueueDropped = queueB_.dropped();
     shared_.decodeResyncs = decodeResyncs_.load();
+    shared_.injectedDrops = injectedDrops_.load();
+}
+
+bool ReceiverPipeline::shouldInjectDrop(const uint8_t* packet, size_t len) {
+    // TODO(M4.0):
+    //   1. !lossInjectionEnabled(config_.loss) -> return false  (关掉时零开销, 放第一行)
+    //   2. decodePacketHeader 失败 -> return false
+    //      **不是** return true —— 畸形包要交给 offer() 去计 packetsMalformed,
+    //      在这里吞掉的话测试工具会把畸形包统计吃走(见头文件的 @note)
+    //   3. 取重传位: 只有 DATA 包才有 DataHeader。
+    //      - type == Data 且 decodeDataHeader 成功 -> isRetransmit = flags & FLAG_RETRANSMIT
+    //      - 其它情况(FEC 等) -> isRetransmit = false, 但**照样按 seq 判丢**
+    //      - DATA 包的 DataHeader 解不出来 -> 同第 2 条, return false
+    //   4. shouldDropPacket(config_.loss, header.seq, isRetransmit);
+    //      为 true 时 ++injectedDrops_ 再 return true
+    (void)packet;
+    (void)len;
+    return false;
 }
 
 void ReceiverPipeline::publishDecodeStats() {

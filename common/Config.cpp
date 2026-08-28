@@ -31,7 +31,9 @@ namespace {
             || key == "send-cap" || key == "recv-timeout" || key == "idle-timeout"
             // M3 接收端解码渲染参数
             || key == "render" || key == "jitter-ms" || key == "vsync"
-            || key == "threads" || key == "stats-interval";
+            || key == "threads" || key == "stats-interval"
+            // M4 弱网对抗参数
+            || key == "loss" || key == "seed";
     }
 }
 
@@ -217,5 +219,9 @@ void Config::printUsage() const {
         "  --vsync <0|1>         Wait for vertical sync (default: 0)\n"
         "  --threads <n>         Decoder thread count (default: 1)\n"
         "  --stats-interval <ms> Receiver statistics interval; 0 disables (default: 1000)\n"
+        "Impairment (receiver, testing only):\n"
+        "  --loss <percent>      Inject packet loss, 0-100; 0 disables (default: 0)\n"
+        "  --seed <n>            PRNG seed for --loss; 0 disables injection (default: 0)\n"
+        "                        Same seed drops the same packets on every run.\n"
     );
 }

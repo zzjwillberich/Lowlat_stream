@@ -84,11 +84,24 @@ struct DataHeader {
     /** @brief 该帧共分成几片, 恒 ≥ 1 */
     uint16_t fragCount = 1;
 
-    /** @brief 标志位, bit0 = 关键帧(IDR) */
+    /** @brief 标志位, bit0 = 关键帧(IDR), bit1 = 重传包; bit2~7 保留(必须为 0) */
     uint8_t flags = 0;
 
     /** @brief flags 的 bit0: 该分片属于关键帧 */
     static constexpr uint8_t FLAG_KEYFRAME = 0x01;
+
+    /**
+     * @brief flags 的 bit1: 这一片是**重传**的, 不是原发的 (M4)
+     *
+     * @note 由发送端响应 NACK 时置位, 原发包恒为 0。接收端靠它区分两件事:
+     *          - 丢包注入器只丢原发包 —— 否则 `hash(seed, seq)` 对同一个 seq
+     *            永远给同一个答案, 重传包会被反复丢掉, NACK 的恢复路径
+     *            **永远跑不出成功的一次**;
+     *          - 统计上"重传救回来几个"要单独算, 不能混进 packetsReceived 的口径。
+     *
+     * @note M4.2 之前没有任何地方会置位它, 恒为 0 —— 这是预留, 不是未实现的功能。
+     */
+    static constexpr uint8_t FLAG_RETRANSMIT = 0x02;
 };
 
 /** @brief PacketHeader 的线上字节数 */
