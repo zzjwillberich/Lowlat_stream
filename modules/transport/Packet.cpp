@@ -212,7 +212,7 @@ Status encodeNackPacket(const PacketHeader& header, const std::vector<uint32_t>&
     const size_t encodedLen = PACKET_HEADER_SIZE + NACK_HEADER_SIZE +
                               entries.size() * NACK_ENTRY_SIZE;
     if (bufLen < encodedLen) {
-        return Status::error(Code::Internal,
+        return Status::error(Code::InvalidArg,
                              "encodeNackPacket: output buffer is too small");
     }
 

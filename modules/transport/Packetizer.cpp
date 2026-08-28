@@ -8,7 +8,6 @@
 #include "modules/transport/Packetizer.h"
 #include "modules/transport/Packet.h"
 
-
 #include <algorithm>
 #include <cstring>
 #include <limits>
@@ -33,44 +32,14 @@ Status Packetizer::packetize(const EncodedFrameView& frame, std::vector<PacketBu
     uint32_t seq = nextSeq_;
 
     for (size_t i = 0; i < fragCount; ++i) {
-        const size_t payloadOffset = i * MAX_PAYLOAD;
-        const size_t payloadLen = std::min(MAX_PAYLOAD, frame.len - payloadOffset);
-
-        PacketBuffer& packet = out[i];
-        packet.resize(PACKET_HEADER_SIZE + DATA_HEADER_SIZE + payloadLen);
-
-        PacketHeader packetHeader;
-        packetHeader.version = PROTOCOL_VERSION;
-        packetHeader.type = PacketType::Data;
-        packetHeader.streamId = streamId_;
-        packetHeader.seq = seq;
-        packetHeader.timestampMs = static_cast<uint32_t>(frame.captureMs);
-
-        DataHeader dataHeader;
-        dataHeader.frameId = static_cast<uint32_t>(frame.frameId);
-        dataHeader.fragIndex = static_cast<uint16_t>(i);
-        dataHeader.fragCount = static_cast<uint16_t>(fragCount);
-        dataHeader.flags = frame.isKey ? DataHeader::FLAG_KEYFRAME : uint8_t{0};
-
-        const Status packetStatus =
-            encodePacketHeader(packetHeader, packet.data(), packet.size());
-        if (!packetStatus.isOk()) {
+        const Status fragmentStatus =
+            packetizeOneFragment(streamId_, seq, frame, static_cast<uint16_t>(i),
+                                 static_cast<uint16_t>(fragCount), false, out[i]);
+        if (!fragmentStatus.isOk()) {
             return Status::error(Code::Internal,
-                                 "Packetizer::packetize: encodePacketHeader failed: " +
-                                     packetStatus.toString());
+                                 "Packetizer::packetize: fragment encoding failed: " +
+                                     fragmentStatus.toString());
         }
-
-        const Status dataStatus =
-            encodeDataHeader(dataHeader, packet.data() + PACKET_HEADER_SIZE,
-                             packet.size() - PACKET_HEADER_SIZE);
-        if (!dataStatus.isOk()) {
-            return Status::error(Code::Internal,
-                                 "Packetizer::packetize: encodeDataHeader failed: " +
-                                     dataStatus.toString());
-        }
-
-        std::memcpy(packet.data() + PACKET_HEADER_SIZE + DATA_HEADER_SIZE,
-                    frame.data + payloadOffset, payloadLen);
         ++seq;
     }
 
@@ -85,7 +54,7 @@ size_t Packetizer::fragmentCount(size_t len) {
 Status packetizeOneFragment(uint16_t streamId, uint32_t seq, const EncodedFrameView& frame,
                             uint16_t fragIndex, uint16_t fragCount, bool isRetransmit,
                             PacketBuffer& out) {
-    // TODO(M4.1):
+    // 校验必须全部放在写 out 之前:
     //   1. 校验全部前置(失败时 out 不动): data 非空、len > 0、fragCount > 0、
     //      fragIndex < fragCount、且 fragIndex * MAX_PAYLOAD < len
     //   2. 算这一片的字节范围: [fragIndex*MAX_PAYLOAD, min((fragIndex+1)*MAX_PAYLOAD, len))
@@ -97,12 +66,57 @@ Status packetizeOneFragment(uint16_t streamId, uint32_t seq, const EncodedFrameV
     //   4. DataHeader: frameId = static_cast<uint32_t>(frame.frameId), fragIndex, fragCount,
     //      flags = (frame.isKey ? FLAG_KEYFRAME : 0) | (isRetransmit ? FLAG_RETRANSMIT : 0)
     //   5. out.resize(21 + 这一片长度), 写头, 再 memcpy 载荷
-    (void)streamId;
-    (void)seq;
-    (void)frame;
-    (void)fragIndex;
-    (void)fragCount;
-    (void)isRetransmit;
-    (void)out;
-    return Status::error(Code::Internal, "packetizeOneFragment: not implemented");
+    if (frame.data == nullptr || frame.len == 0) {
+        return Status::error(
+            Code::InvalidArg,
+            "packetizeOneFragment: frame data must not be null and len must be positive");
+    }
+    if (fragCount == 0) {
+        return Status::error(Code::InvalidArg,
+                             "packetizeOneFragment: fragCount must be positive");
+    }
+    if (fragIndex >= fragCount) {
+        return Status::error(Code::InvalidArg,
+                             "packetizeOneFragment: fragIndex must be smaller than fragCount");
+    }
+
+    const size_t payloadOffset = static_cast<size_t>(fragIndex) * MAX_PAYLOAD;
+    if (payloadOffset >= frame.len) {
+        return Status::error(Code::InvalidArg,
+                             "packetizeOneFragment: fragment starts beyond frame data");
+    }
+    const size_t payloadLen = std::min(MAX_PAYLOAD, frame.len - payloadOffset);
+
+    PacketHeader packetHeader;
+    packetHeader.type = PacketType::Data;
+    packetHeader.streamId = streamId;
+    packetHeader.seq = seq;
+    packetHeader.timestampMs = static_cast<uint32_t>(frame.captureMs);
+
+    DataHeader dataHeader;
+    dataHeader.frameId = static_cast<uint32_t>(frame.frameId);
+    dataHeader.fragIndex = fragIndex;
+    dataHeader.fragCount = fragCount;
+    dataHeader.flags = frame.isKey ? DataHeader::FLAG_KEYFRAME : uint8_t{0};
+    if (isRetransmit) dataHeader.flags |= DataHeader::FLAG_RETRANSMIT;
+
+    out.resize(PACKET_HEADER_SIZE + DATA_HEADER_SIZE + payloadLen);
+    const Status packetStatus = encodePacketHeader(packetHeader, out.data(), out.size());
+    if (!packetStatus.isOk()) {
+        return Status::error(Code::Internal,
+                             "packetizeOneFragment: encodePacketHeader failed: " +
+                                 packetStatus.toString());
+    }
+    const Status dataStatus =
+        encodeDataHeader(dataHeader, out.data() + PACKET_HEADER_SIZE,
+                         out.size() - PACKET_HEADER_SIZE);
+    if (!dataStatus.isOk()) {
+        return Status::error(Code::Internal,
+                             "packetizeOneFragment: encodeDataHeader failed: " +
+                                 dataStatus.toString());
+    }
+
+    std::memcpy(out.data() + PACKET_HEADER_SIZE + DATA_HEADER_SIZE,
+                frame.data + payloadOffset, payloadLen);
+    return Status::ok();
 }

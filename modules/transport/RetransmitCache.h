@@ -175,8 +175,6 @@ private:
     RetransmitCacheConfig config_;
     RetransmitCacheStats stats_;
 
-    // TODO(M4.1): deque 就够 —— 存进来天然按时间有序, 淘汰只从头部弹,
-    //             查找线性扫几到十几条。别上 map: 反查的键是**区间**不是点,
-    //             map 帮不上忙, 只会多一层间接。
+    /** @brief 按存入时间排列的帧; 淘汰只从头部弹出 */
     std::deque<Entry> entries_;
 };
