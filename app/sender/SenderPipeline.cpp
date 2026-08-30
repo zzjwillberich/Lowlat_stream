@@ -64,6 +64,7 @@ Status SenderPipeline::run(const std::atomic<bool>& stopRequested) {
     stats_.queuePeak = queue_->peak();
     if (sendQueue_) {
         stats_.sendQueuePeak = sendQueue_->peak();
+        if (fecEncoder_) stats_.fec = fecEncoder_->stats();
     }
     uint64_t end = steadyNowMs();
     stats_.elapsedMs = end - start;
@@ -191,10 +192,12 @@ Status SenderPipeline::openResources() {
             closeResources();
             return st;
         }
+        // TODO(M4.2): fec.groupSize > 0 时创建 fecEncoder_; 为 0 时保持 nullptr,
+        //   sendLoop 靠它判断"这一级不存在", 同 retransmitCache_ 的写法。
         if (config_.retransmit.retentionMs > 0) {
             retransmitCache_ =
                 std::make_unique<RetransmitCache>(config_.retransmit);
-            reverseBuf_.resize(MAX_DATA_PACKET_SIZE);
+            reverseBuf_.resize(MAX_PACKET_SIZE);  // 同接收端: 一律按最大的包类型开
         }
     }
 
@@ -334,6 +337,18 @@ void SenderPipeline::sendLoop() {
                 }
             }
 
+            // TODO(M4.2): 在这里生成并发出 FEC 包 —— **必须在本帧的 DATA 全部发完之后**,
+            //   而且要在 store() 之前(store 会把 frame->data move 走, view.data 虽然还
+            //   指向同一块堆内存, 但语义上那一帧已经不属于这里了)。
+            //     if (fecEncoder_) {
+            //         fecEncoder_->buildForFrame(packets_, baseSeq, packetizer_.streamId(),
+            //                                    static_cast<uint32_t>(view.captureMs),
+            //                                    fecPackets_);
+            //         for (auto& p : fecPackets_) socket_.sendTo(config_.target, ...);
+            //     }
+            //   FEC 包**不计入 packetsSent** —— 那个数是"原发了多少媒体包", 混进冗余包
+            //   之后两端的包数对账就再也对不上了(同重传包的理由)。它自己的量在
+            //   fecEncoder_->stats() 里。
             if (retransmitCache_) {
                 const uint16_t fragCount =
                     static_cast<uint16_t>(packets_.size());

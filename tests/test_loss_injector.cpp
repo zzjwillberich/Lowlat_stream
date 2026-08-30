@@ -29,7 +29,7 @@ namespace {
     std::vector<uint32_t> droppedSeqs(const LossConfig& c, uint32_t n) {
         std::vector<uint32_t> out;
         for (uint32_t s = 0; s < n; ++s) {
-            if (shouldDropPacket(c, s, false)) out.push_back(s);
+            if (shouldDropPacket(c, s, PacketType::Data, false)) out.push_back(s);
         }
         return out;
     }
@@ -41,7 +41,7 @@ TEST(LossInjector, DisabledByDefault) {
     const LossConfig c;  // 什么都不给
     EXPECT_FALSE(lossInjectionEnabled(c)) << "测试工具的默认必须是不生效";
     for (uint32_t s = 0; s < 1000; ++s) {
-        EXPECT_FALSE(shouldDropPacket(c, s, false));
+        EXPECT_FALSE(shouldDropPacket(c, s, PacketType::Data, false));
     }
 }
 
@@ -71,9 +71,9 @@ TEST(LossInjector, HundredPercentDropsEverything) {
 TEST(LossInjector, SameSeedAndSeqAlwaysGiveTheSameAnswer) {
     const LossConfig c = cfg(0xC0FFEE, 30);
     for (uint32_t s = 0; s < 500; ++s) {
-        const bool first = shouldDropPacket(c, s, false);
+        const bool first = shouldDropPacket(c, s, PacketType::Data, false);
         for (int repeat = 0; repeat < 5; ++repeat) {
-            EXPECT_EQ(shouldDropPacket(c, s, false), first) << "seq=" << s;
+            EXPECT_EQ(shouldDropPacket(c, s, PacketType::Data, false), first) << "seq=" << s;
         }
     }
 }
@@ -90,11 +90,11 @@ TEST(LossInjector, TheAnswerDoesNotDependOnCallOrder) {
 
     std::set<uint32_t> backward;
     for (uint32_t s = 1000; s-- > 0;) {
-        if (shouldDropPacket(c, s, false)) backward.insert(s);
+        if (shouldDropPacket(c, s, PacketType::Data, false)) backward.insert(s);
     }
 
     // 中间穿插一堆无关的调用, 模拟重传包插队
-    for (uint32_t s = 0; s < 5000; ++s) (void)shouldDropPacket(c, s * 7 + 3, false);
+    for (uint32_t s = 0; s < 5000; ++s) (void)shouldDropPacket(c, s * 7 + 3, PacketType::Data, false);
 
     const std::vector<uint32_t> again = droppedSeqs(c, 1000);
     EXPECT_EQ(again, forward) << "插了别的调用之后结果变了 —— 说明内部有状态";
@@ -104,8 +104,8 @@ TEST(LossInjector, TheAnswerDoesNotDependOnCallOrder) {
 TEST(LossInjector, RetransmittedPacketsAreNeverDropped) {
     const LossConfig c = cfg(999, 100);  // 连 100% 都不许丢重传包
     for (uint32_t s = 0; s < 1000; ++s) {
-        EXPECT_TRUE(shouldDropPacket(c, s, false)) << "原发包该丢, seq=" << s;
-        EXPECT_FALSE(shouldDropPacket(c, s, true)) << "重传包不该丢, seq=" << s;
+        EXPECT_TRUE(shouldDropPacket(c, s, PacketType::Data, false)) << "原发包该丢, seq=" << s;
+        EXPECT_FALSE(shouldDropPacket(c, s, PacketType::Data, true)) << "重传包不该丢, seq=" << s;
     }
 }
 
@@ -135,7 +135,7 @@ TEST(LossInjector, ConsecutiveSeqsAreNotCorrelated) {
     const LossConfig c = cfg(0xABCDEF, 10);
     size_t run = 0, longRuns = 0;
     for (uint32_t s = 0; s < 20000; ++s) {
-        if (shouldDropPacket(c, s, false)) {
+        if (shouldDropPacket(c, s, PacketType::Data, false)) {
             if (++run >= 4) ++longRuns;
         } else {
             run = 0;
@@ -168,7 +168,7 @@ TEST(LossInjector, SeqWrapAroundNeedsNoSpecialCase) {
     size_t dropped = 0;
     for (uint32_t i = 0; i < 2000; ++i) {
         const uint32_t seq = 0xFFFFFFFFu - 1000 + i;  // 故意跨过 0
-        if (shouldDropPacket(c, seq, false)) ++dropped;
+        if (shouldDropPacket(c, seq, PacketType::Data, false)) ++dropped;
     }
     EXPECT_GT(dropped, 0u);
     EXPECT_LT(dropped, 2000u);

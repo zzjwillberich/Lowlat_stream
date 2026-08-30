@@ -38,7 +38,8 @@ ReceiverPipeline::ReceiverPipeline(ReceiverPipelineConfig config)
       // 可诊断的 InvalidArg，而不是在构造阶段中止进程。
       queueA_(std::max<size_t>(1, config_.decodeQueueCapacity)),
       queueB_(std::max<size_t>(1, config_.renderQueueCapacity)),
-      nackTracker_(config_.nack) {}
+      nackTracker_(config_.nack),
+      fecDecoder_(config_.fec) {}
 
 Status ReceiverPipeline::open() {
     Status status = validateConfig();
@@ -79,7 +80,10 @@ Status ReceiverPipeline::open() {
         }
     }
 
-    recvBuf_.resize(MAX_DATA_PACKET_SIZE);
+    // 必须是 MAX_PACKET_SIZE 而不是 MAX_DATA_PACKET_SIZE: FEC 包比 DATA 包大 3 字节,
+    // 按 1221 开的话满载的 FEC 包会被 recvfrom 的 MSG_TRUNC 判成"数据报大于缓冲区"
+    // 返回 NetError —— 现象是"FEC 全部收不到而 DATA 一切正常"。
+    recvBuf_.resize(MAX_PACKET_SIZE);
     opened_ = true;
     return Status::ok();
 }
@@ -247,6 +251,23 @@ void ReceiverPipeline::recvLoop(const std::atomic<bool>& stopRequested) {
                 // 从来没到过, 那就不该从它身上学到"对端是谁"。这样"极高丢包率下
                 // 反向通道还建不建得起来"才是个能被测出来的问题, 而不是被测试工具
                 // 偷偷绕过去的问题。lastPacketMs 是唯一的例外, 理由见上。
+                // TODO(M4.2): 这里要按包类型分流。现在的三行都只对 DATA 包成立
+                //   (offer 会把非 DATA 包判 InvalidArg 退掉, 所以目前不会出错, 只是白走)。
+                //
+                //   解出 header.type 之后:
+                //     Data -> trackPeer / requestRetransmissions / fecDecoder_.onDataPacket
+                //             / assembler_.offer   —— 顺序就是现在这样, onDataPacket 放在
+                //             offer 之前或之后都行, 它只是存一份副本
+                //     Fec  -> **不**参与 trackPeer("对端"的定义是发媒体数据的那个人),
+                //             **不**喂 nackTracker_(FEC 丢了不该请求重传, 它本来就是
+                //             "丢了不要紧"的冗余), 只调 fecDecoder_.onFecPacket();
+                //             恢复出包时, 那个包要**当成刚收到的 DATA 包**再走一遍:
+                //               nackTracker_.onPacket(seq, fragCount)  <- 销掉缺口, 否则
+                //                   已经被 FEC 补上的包还会被 NACK 请求一遍
+                //               assembler_.offer(recovered)
+                //             但**不要**再喂回 fecDecoder_.onDataPacket() —— 它已经被
+                //             算进这一组了。
+                //     其它 -> 忽略(接收端不该收到 NACK/PLI, 那是反向通道的包)
                 trackPeer(recvBuf_.data(), receivedBytes, from);
                 requestRetransmissions(recvBuf_.data(), receivedBytes);
                 (void)assembler_.offer(recvBuf_.data(), receivedBytes);
@@ -496,6 +517,7 @@ void ReceiverPipeline::publishRecvStats() {
     shared_.decodeResyncs = decodeResyncs_.load();
     shared_.injectedDrops = injectedDrops_.load();
     shared_.nack = nackTracker_.stats();
+    shared_.fec = fecDecoder_.stats();
     shared_.nackPacketsSent = nackPacketsSent_.load();
     shared_.nackSendErrors = nackSendErrors_.load();
 }
@@ -593,7 +615,7 @@ bool ReceiverPipeline::shouldInjectDrop(const uint8_t* packet, size_t len) {
     //      - type == Data 且 decodeDataHeader 成功 -> isRetransmit = flags & FLAG_RETRANSMIT
     //      - 其它情况(FEC 等) -> isRetransmit = false, 但**照样按 seq 判丢**
     //      - DATA 包的 DataHeader 解不出来 -> 同第 2 条, return false
-    //   4. shouldDropPacket(config_.loss, header.seq, isRetransmit);
+    //   4. shouldDropPacket(config_.loss, header.seq, header.type, isRetransmit);
     //      为 true 时 ++injectedDrops_ 再 return true
     if (!lossInjectionEnabled(config_.loss)) return false;
 
@@ -611,7 +633,7 @@ bool ReceiverPipeline::shouldInjectDrop(const uint8_t* packet, size_t len) {
         isRetransmit = (dataHeader.flags & DataHeader::FLAG_RETRANSMIT) != 0;
     }
 
-    if (!shouldDropPacket(config_.loss, header.seq, isRetransmit)) return false;
+    if (!shouldDropPacket(config_.loss, header.seq, header.type, isRetransmit)) return false;
     ++injectedDrops_;
     return true;
 }

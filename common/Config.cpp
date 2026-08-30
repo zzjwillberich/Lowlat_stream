@@ -34,7 +34,8 @@ namespace {
             || key == "threads" || key == "stats-interval"
             // M4 弱网对抗参数
             || key == "loss" || key == "seed"
-            || key == "nack-window" || key == "nack-retries" || key == "retx-ms";
+            || key == "nack-window" || key == "nack-retries" || key == "retx-ms"
+            || key == "fec-group" || key == "fec-recent";
     }
 }
 
@@ -230,5 +231,9 @@ void Config::printUsage() const {
         "  --nack-retries <n>    Max NACK requests per lost packet (default: 3)\n"
         "  --retx-ms <ms>        Sender retransmit cache retention;\n"
         "                        0 disables retransmission (default: 200)\n"
+        "  --fec-group <n>       Sender FEC group size in packets;\n"
+        "                        0 disables FEC (default: 4)\n"
+        "  --fec-recent <n>      Receiver packets kept for FEC recovery;\n"
+        "                        0 disables FEC decoding (default: 64)\n"
     );
 }

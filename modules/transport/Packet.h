@@ -288,3 +288,85 @@ Status encodeNackPacket(const PacketHeader& header, const std::vector<uint32_t>&
  *          必须先确认它和实际长度相符 —— 否则就是一次越界读。
  */
 Status decodeNackPacket(const uint8_t* buf, size_t bufLen, std::vector<uint32_t>& out);
+
+/**
+ * FEC 包的私有头, 紧跟 PacketHeader 之后, 线上 12 字节。
+ *
+ * 载荷是组内各 DATA 分片**载荷**(不含包头)按字节异或的结果, 短的补零。
+ *
+ * @note 恢复**只认** groupBaseSeq + groupSize, 这两个字段是自描述的。
+ *          groupIndex/groupCount 只用于统计和诊断("这帧的 FEC 收全了吗"), 不参与恢复。
+ *          理由: **XOR 恢复没有任何校验**。异或错了一组包, 出来的是一串看着完全合法的
+ *          字节, 长度也对, 组包器会把它当真分片收下喂给解码器 —— 没有报错, 只有偶发花屏。
+ *          分片有 fragIndex/fragCount 可以验证拼得对不对, XOR 没有对应的东西,
+ *          所以头里必须**直接写明覆盖哪些 seq**, 而不是让接收端按切分规则推算。
+ */
+struct FecHeader {
+    /** @brief 本组覆盖 [groupBaseSeq, groupBaseSeq + groupSize) 这一段 DATA 的 seq */
+    uint32_t groupBaseSeq = 0;
+
+    /** @brief 组内 DATA 包数, 恒 >= 2; 1 个包的"FEC"就是原包副本, 那不叫纠错 */
+    uint16_t groupSize = 0;
+
+    /**
+     * @brief 组内各分片**载荷长度**的异或
+     *
+     * @note 必须有这个字段: XOR 出来的是**字节**, 不是**长度**。一帧的最后一片是短的,
+     *          恢复时长度猜错就是静默损坏(多出或少掉几百字节拼进帧里)。
+     *          用它异或掉已收到的那些长度, 就得到缺失那片的真实长度。RFC 5109 同款做法。
+     */
+    uint16_t payloadLenXor = 0;
+
+    /** @brief 本帧的第几组, 从 0 开始; **仅供诊断** */
+    uint8_t groupIndex = 0;
+
+    /** @brief 本帧共几组; **仅供诊断** */
+    uint8_t groupCount = 0;
+
+    /** @brief 保留, 必须为 0; 接收端应当忽略而不是判成畸形 */
+    uint16_t reserved = 0;
+};
+
+/** @brief FecHeader 的线上字节数 */
+constexpr size_t FEC_HEADER_SIZE = 12;
+
+/**
+ * @brief 一个 FEC 包的最大线上长度
+ *
+ * @note 12 + 12 + 1200 = **1224**, 比 MAX_DATA_PACKET_SIZE(1221) **大 3 字节** ——
+ *          FEC 头比 DATA 头宽 3 字节。这 3 字节很容易咬人: 接收缓冲区如果还按
+ *          MAX_DATA_PACKET_SIZE 开, 满载的 FEC 包会被 recvfrom 的 MSG_TRUNC 判成
+ *          "数据报大于缓冲区"返回 NetError —— 现象是"FEC 全部收不到, 而 DATA 一切正常",
+ *          排查方向会指向 FEC 的编码逻辑, 而根因在一个 resize 上。
+ *          **所有收包缓冲一律用 MAX_PACKET_SIZE。**
+ */
+constexpr size_t MAX_FEC_PACKET_SIZE = PACKET_HEADER_SIZE + FEC_HEADER_SIZE + MAX_PAYLOAD;
+
+/**
+ * @brief 任意类型的包的最大线上长度; 所有收包缓冲都该按它开
+ *
+ * @note 目前最大的是 FEC(1224); NACK 满载是 12 + 2 + 201*6 = 1220, DATA 是 1221。
+ *          加新包类型时记得把它算进来 —— 这是**一处**要改的地方, 而不是每个收包点各改一遍。
+ */
+constexpr size_t MAX_PACKET_SIZE =
+    MAX_FEC_PACKET_SIZE > MAX_DATA_PACKET_SIZE ? MAX_FEC_PACKET_SIZE : MAX_DATA_PACKET_SIZE;
+
+/**
+ * @brief 把 FEC 私有头写入缓冲区(网络字节序)
+ *
+ * @return Ok         写入 FEC_HEADER_SIZE 字节
+ *  InvalidArg buf 为空, bufLen 不足, 或 groupSize < 2
+ */
+Status encodeFecHeader(const FecHeader& header, uint8_t* buf, size_t bufLen);
+
+/**
+ * @brief 从缓冲区解析 FEC 私有头
+ *
+ * @return Ok         解析成功
+ *  InvalidArg buf 为空或 bufLen < FEC_HEADER_SIZE
+ *  NetError   groupSize < 2 (对端发错了或包被损坏)
+ *
+ * @note reserved 非 0 **不算畸形** —— 那是给以后版本留的扩展位, 老接收端应当忽略,
+ *          否则协议再也没法往前兼容地加东西(同 DataHeader 的 bit2~7)。
+ */
+Status decodeFecHeader(const uint8_t* buf, size_t bufLen, FecHeader& out);

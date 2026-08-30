@@ -13,6 +13,8 @@
 
 #include <cstdint>
 
+#include "modules/transport/Packet.h"
+
 /**
  * @brief seed 的哨兵值: 表示**不注入**
  *
@@ -50,7 +52,8 @@ bool lossInjectionEnabled(const LossConfig& config);
  * @brief 判断序号为 seq 的这一个包该不该被"丢掉"
  *
  * @param config       注入配置
- * @param seq          PacketHeader::seq, 全局包序号
+ * @param seq          PacketHeader::seq, **该类型**的包序号
+ * @param type         PacketHeader::type; 必须混进哈希, 理由见下
  * @param isRetransmit 这一片是不是重传的(DataHeader::FLAG_RETRANSMIT)
  *
  * @return true 表示调用方应当**当作没收到**这个包 —— 直接返回, 不要交给
@@ -71,5 +74,16 @@ bool lossInjectionEnabled(const LossConfig& config);
  *          在 flags 里说明。
  *
  * @note seq 回绕**不需要特殊处理**: 哈希对 uint32 全域都有定义, 回绕只是换了个输入。
+ *
+ * @note **type 必须参与混合。** M4.2 起 DATA 和 FEC 各有自己的 seq 计数器, 两条流的
+ *          序号空间重叠 —— 只用 (seed, seq) 的话, FEC#3 和 DATA#3 拿到同一个哈希,
+ *          **逐位同丢同留**。直接危害不大(FEC#g 覆盖的是 DATA seq [g*K, g*K+K-1],
+ *          只有 g=0 那组才自己撞自己), 但那是结构性的假相关, 不是网络会有的行为,
+ *          它会以预测不到的方式影响测出来的 FEC 恢复率。
+ *
+ * @note 加上 type 之后, **同一个种子丢掉的 DATA 包集合会和 M4.1 时不一样**。
+ *          这不影响可复现性(重要的性质是"同一个种子可复现", 不是"某一批特定的包"),
+ *          但拿 M4.1 的数字和 M4.2 的对比时, 基线要重跑一遍。
  */
-bool shouldDropPacket(const LossConfig& config, uint32_t seq, bool isRetransmit);
+bool shouldDropPacket(const LossConfig& config, uint32_t seq, PacketType type,
+                      bool isRetransmit);

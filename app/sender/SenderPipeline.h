@@ -18,6 +18,7 @@
 #include "common/Status.h"
 #include "modules/capture/ISource.h"
 #include "modules/encode/Encoder.h"
+#include "modules/transport/FecEncoder.h"
 #include "modules/transport/Packetizer.h"
 #include "modules/transport/RetransmitCache.h"
 #include "modules/transport/UdpSocket.h"
@@ -98,6 +99,14 @@ struct SenderPipelineConfig {
      *          所以给 1ms 而不是 D16 的 5ms。1000 次/秒的空转循环可以忽略。
      */
     int sendPollMs = 1;
+
+    /**
+     * @brief FEC 分组策略 (M4.2); groupSize 为 0 表示**不发 FEC**
+     *
+     * @note FEC 包在本帧最后一片之后紧跟发出, **不跨帧** —— 跨帧的话 FEC 包比它保护的
+     *          数据晚一整帧, 而 FEC 相对 NACK 的全部优势就是"不用等一个往返"。
+     */
+    FecEncoderConfig fec;
 };
 
 /**
@@ -147,6 +156,15 @@ struct SenderPipelineStats {
 
     /** @brief 反向通道上收到的畸形包数; 和 NACK 计数分开, 同 lost / malformed 的理由 */
     uint64_t reverseMalformed = 0;
+
+    /**
+     * @brief FEC 编码器的计数器快照 (M4.2)
+     *
+     * @note `fec.fecBytes / encodedBytes` 就是**实测的冗余开销**。这个数要和
+     *          接收端的 FEC 恢复率一起报 —— 单看恢复率不知道花了多少钱, 单看开销
+     *          不知道买到了什么。
+     */
+    FecEncoderStats fec;
 };
 
 /**
@@ -290,6 +308,12 @@ private:
      *          改成 move 进缓存一次拷贝都没有。详见 [[D23]]。
      */
     std::unique_ptr<RetransmitCache> retransmitCache_;
+
+    /** @brief M4.2 冗余包生成器; 只在 fec.groupSize > 0 时创建 */
+    std::unique_ptr<FecEncoder> fecEncoder_;
+
+    /** @brief FEC 包的输出缓冲, 同 packets_ 跨帧复用 */
+    std::vector<PacketBuffer> fecPackets_;
 
     /** @brief drainReverseChannel 复用的收包缓冲和 seq 列表, 同 packets_ 的理由 */
     std::vector<uint8_t> reverseBuf_;

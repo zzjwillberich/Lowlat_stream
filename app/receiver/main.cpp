@@ -62,6 +62,10 @@ namespace {
         pipeline.nack.windowPackets =
             static_cast<size_t>(std::max(0, config.getInt("nack-window", 1024)));
         pipeline.nack.maxRequestsPerSeq = config.getInt("nack-retries", 3);
+
+        // M4.2 FEC 解码。--fec-recent=0 关掉。
+        pipeline.fec.recentPackets =
+            static_cast<size_t>(std::max(0, config.getInt("fec-recent", 64)));
         return pipeline;
     }
 }  // namespace
@@ -105,7 +109,8 @@ int main(int argc, char** argv) {
              "malformed=%llu dropped=%llu recv_errors=%llu jitter_dropped=%llu "
              "queue_dropped=%llu resyncs=%llu injected_drops=%llu "
              "nack_sent=%llu nack_seqs=%llu nack_recovered=%llu nack_gaveup=%llu "
-             "lost_exact=%llu nack_pending=%zu decoded=%llu "
+             "lost_exact=%llu nack_pending=%zu "
+             "fec_recv=%llu fec_recovered=%llu fec_unrecoverable=%llu decoded=%llu "
              "rendered=%llu queue_peak=%zu/%zu elapsed=%llums",
              static_cast<unsigned long long>(stats.framesWritten),
              static_cast<unsigned long long>(stats.bytesWritten),
@@ -128,6 +133,9 @@ int main(int argc, char** argv) {
              static_cast<unsigned long long>(stats.nack.givenUp),
              static_cast<unsigned long long>(stats.nack.lostForReal),
              stats.nack.pending,
+             static_cast<unsigned long long>(stats.fec.fecPacketsReceived),
+             static_cast<unsigned long long>(stats.fec.groupsRecovered),
+             static_cast<unsigned long long>(stats.fec.groupsUnrecoverable),
              static_cast<unsigned long long>(stats.decoder.framesOut),
              static_cast<unsigned long long>(stats.renderer.framesRendered),
              stats.decodeQueuePeak, stats.renderQueuePeak,

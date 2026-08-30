@@ -22,6 +22,7 @@
 #include "modules/render/IRenderer.h"
 #include "modules/transport/FrameAssembler.h"
 #include "modules/transport/JitterBuffer.h"
+#include "modules/transport/FecDecoder.h"
 #include "modules/transport/LossInjector.h"
 #include "modules/transport/NackTracker.h"
 #include "modules/transport/UdpSocket.h"
@@ -119,6 +120,14 @@ struct ReceiverPipelineConfig {
      *          没人看的统计。"关掉 = 那一级完全不存在", 同 renderKind 为空。
      */
     NackTrackerConfig nack;
+
+    /**
+     * @brief FEC 解码 (M4.2); recentPackets 为 0 表示**不解 FEC**
+     *
+     * @note 关掉时连最近包缓冲都不该维护 —— 每个 DATA 包都要往里拷一份,
+     *          不用的话是纯浪费。"关掉 = 那一级完全不存在", 同 renderKind 为空。
+     */
+    FecDecoderConfig fec;
 };
 
 /**
@@ -216,6 +225,17 @@ struct ReceiverPipelineStats {
 
     /** @brief 缺口跟踪器的计数器快照 (M4.1) */
     NackTrackerStats nack;
+
+    /**
+     * @brief FEC 解码器的计数器快照 (M4.2)
+     *
+     * @note `groupsRecovered / (groupsRecovered + groupsUnrecoverable)` 是 FEC 的
+     *          **实际恢复率** —— M4.2 唯一能被验收的数字。但**回环上它没有意义**:
+     *          NACK 已经把能救的都救了(实测 30% 丢包下 recovered=656/656), FEC 的
+     *          边际价值要等 RTT 大到重传赶不上 playAt 才体现得出来。见 [[D24]]。
+     *          能测的是另外两个: NACK 请求数应当**下降**, 发出的包数应当上升 1/K。
+     */
+    FecDecoderStats fec;
 
     /** @brief 实际发出去的 NACK **包**数; 一个包可以请求几百个 seq */
     uint64_t nackPacketsSent = 0;
@@ -539,6 +559,12 @@ private:
 
     /** @brief M4.1 缺口跟踪器; 收包线程独占, 不需要加锁 */
     NackTracker nackTracker_;
+
+    /** @brief M4.2 冗余解码器; 同样是收包线程独占 */
+    FecDecoder fecDecoder_;
+
+    /** @brief 恢复出来的包缓冲, 复用 */
+    PacketBuffer recoveredBuf_;
 
     /** @brief 复用的 NACK 发送缓冲和 seq 列表, 同 recvBuf_ 的理由 */
     std::vector<uint32_t> nackTargets_;

@@ -1,4 +1,6 @@
 add_library(lltransport STATIC
+    FecDecoder.cpp
+    FecEncoder.cpp
     FrameAssembler.cpp
     JitterBuffer.cpp
     LossInjector.cpp

@@ -305,3 +305,29 @@ Status decodeNackPacket(const uint8_t* buf, size_t bufLen, std::vector<uint32_t>
     }
     return Status::ok();
 }
+
+Status encodeFecHeader(const FecHeader& header, uint8_t* buf, size_t bufLen) {
+    // TODO(M4.2): 逐字段按偏移写, 全部网络序:
+    //   0  4  groupBaseSeq   4  2  groupSize
+    //   6  2  payloadLenXor  8  1  groupIndex
+    //   9  1  groupCount    10  2  reserved
+    //   校验: buf 非空, bufLen >= FEC_HEADER_SIZE, groupSize >= 2 -> 否则 InvalidArg
+    //   groupSize 在**编码时**就查, 同 encodePacketHeader 查 type 的理由 ——
+    //   本端写出一个 groupSize=1 的 FEC 包, 现象是"对端一直不恢复", 排查方向指向对端。
+    (void)header;
+    (void)buf;
+    (void)bufLen;
+    return Status::error(Code::Internal, "encodeFecHeader: not implemented");
+}
+
+Status decodeFecHeader(const uint8_t* buf, size_t bufLen, FecHeader& out) {
+    // TODO(M4.2): 同 decodeDataHeader 的形状 —— 先写局部变量, 全部校验通过再整体赋给出参,
+    //   失败时不留下半解析的垃圾字段。
+    //   buf 为空 / bufLen 不足 -> InvalidArg (本端调用错误)
+    //   groupSize < 2          -> NetError   (对端或网络的问题, 丢包 + 计数)
+    //   reserved 非 0          -> **照常解析**, 不算畸形
+    (void)buf;
+    (void)bufLen;
+    (void)out;
+    return Status::error(Code::Internal, "decodeFecHeader: not implemented");
+}

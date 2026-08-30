@@ -45,6 +45,9 @@ namespace {
 
         // M4.1 重传。--retx-ms=0 关掉整条重传路径(连反向通道的 recvFrom 都不走)。
         pipeline.retransmit.retentionMs = config.getInt("retx-ms", 200);
+
+        // M4.2 FEC。--fec-group=0 关掉冗余包(连生成都不做)。
+        pipeline.fec.groupSize = static_cast<uint16_t>(config.getInt("fec-group", 4));
         pipeline.maxFrames     = config.getInt("frames", 100);
         pipeline.rawDumpPath   = config.get("dump-raw");
         pipeline.h264DumpPath  = config.get("dump");
@@ -90,7 +93,7 @@ int main(int argc, char** argv) {
              "stopped: captured=%llu encoded=%llu bytes=%llu key=%llu "
              "queue_peak=%zu send_queue_peak=%zu packets_sent=%llu send_errors=%llu "
              "nacks=%llu nacked_seqs=%llu retransmitted=%llu retx_misses=%llu "
-             "reverse_malformed=%llu elapsed=%llums",
+             "reverse_malformed=%llu fec_packets=%llu fec_bytes=%llu elapsed=%llums",
              static_cast<unsigned long long>(stats.capturedFrames),
              static_cast<unsigned long long>(stats.encodedFrames),
              static_cast<unsigned long long>(stats.encodedBytes),
@@ -102,6 +105,8 @@ int main(int argc, char** argv) {
              static_cast<unsigned long long>(stats.packetsRetransmitted),
              static_cast<unsigned long long>(stats.retransmitMisses),
              static_cast<unsigned long long>(stats.reverseMalformed),
+             static_cast<unsigned long long>(stats.fec.fecPacketsBuilt),
+             static_cast<unsigned long long>(stats.fec.fecBytes),
              static_cast<unsigned long long>(stats.elapsedMs));
     return 0;
 }
