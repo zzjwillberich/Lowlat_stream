@@ -251,26 +251,43 @@ void ReceiverPipeline::recvLoop(const std::atomic<bool>& stopRequested) {
                 // 从来没到过, 那就不该从它身上学到"对端是谁"。这样"极高丢包率下
                 // 反向通道还建不建得起来"才是个能被测出来的问题, 而不是被测试工具
                 // 偷偷绕过去的问题。lastPacketMs 是唯一的例外, 理由见上。
-                // TODO(M4.2): 这里要按包类型分流。现在的三行都只对 DATA 包成立
-                //   (offer 会把非 DATA 包判 InvalidArg 退掉, 所以目前不会出错, 只是白走)。
-                //
-                //   解出 header.type 之后:
-                //     Data -> trackPeer / requestRetransmissions / fecDecoder_.onDataPacket
-                //             / assembler_.offer   —— 顺序就是现在这样, onDataPacket 放在
-                //             offer 之前或之后都行, 它只是存一份副本
-                //     Fec  -> **不**参与 trackPeer("对端"的定义是发媒体数据的那个人),
-                //             **不**喂 nackTracker_(FEC 丢了不该请求重传, 它本来就是
-                //             "丢了不要紧"的冗余), 只调 fecDecoder_.onFecPacket();
-                //             恢复出包时, 那个包要**当成刚收到的 DATA 包**再走一遍:
-                //               nackTracker_.onPacket(seq, fragCount)  <- 销掉缺口, 否则
-                //                   已经被 FEC 补上的包还会被 NACK 请求一遍
-                //               assembler_.offer(recovered)
-                //             但**不要**再喂回 fecDecoder_.onDataPacket() —— 它已经被
-                //             算进这一组了。
-                //     其它 -> 忽略(接收端不该收到 NACK/PLI, 那是反向通道的包)
-                trackPeer(recvBuf_.data(), receivedBytes, from);
-                requestRetransmissions(recvBuf_.data(), receivedBytes);
-                (void)assembler_.offer(recvBuf_.data(), receivedBytes);
+                PacketHeader header;
+                if (!decodePacketHeader(recvBuf_.data(), receivedBytes, header).isOk()) {
+                    // 保留原有的畸形包计数路径。
+                    (void)assembler_.offer(recvBuf_.data(), receivedBytes);
+                } else if (header.type == PacketType::Data) {
+                    trackPeer(recvBuf_.data(), receivedBytes, from);
+                    requestRetransmissions(recvBuf_.data(), receivedBytes);
+
+                    DataHeader dataHeader;
+                    if (decodeDataHeader(recvBuf_.data() + PACKET_HEADER_SIZE,
+                                         receivedBytes - PACKET_HEADER_SIZE,
+                                         dataHeader)
+                            .isOk()) {
+                        fecDecoder_.onDataPacket(recvBuf_.data(), receivedBytes);
+                    }
+                    (void)assembler_.offer(recvBuf_.data(), receivedBytes);
+                } else if (header.type == PacketType::Fec) {
+                    if (fecDecoder_.onFecPacket(recvBuf_.data(), receivedBytes,
+                                                recoveredBuf_)) {
+                        if (config_.nack.windowPackets > 0) {
+                            PacketHeader recoveredHeader;
+                            DataHeader recoveredDataHeader;
+                            if (decodePacketHeader(recoveredBuf_.data(), recoveredBuf_.size(),
+                                                   recoveredHeader)
+                                    .isOk() &&
+                                decodeDataHeader(
+                                    recoveredBuf_.data() + PACKET_HEADER_SIZE,
+                                    recoveredBuf_.size() - PACKET_HEADER_SIZE,
+                                    recoveredDataHeader)
+                                    .isOk()) {
+                                nackTracker_.onPacket(recoveredHeader.seq,
+                                                      recoveredDataHeader.fragCount);
+                            }
+                        }
+                        (void)assembler_.offer(recoveredBuf_.data(), recoveredBuf_.size());
+                    }
+                }
             }
         }
 
@@ -544,6 +561,7 @@ void ReceiverPipeline::trackPeer(const uint8_t* packet, size_t len, const Endpoi
 
     if (peer_.ip != from.ip || peer_.port != from.port) {
         nackTracker_.reset();
+        fecDecoder_.reset();
     }
     peer_ = from;
 }

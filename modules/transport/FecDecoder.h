@@ -144,8 +144,6 @@ private:
     FecDecoderConfig config_;
     FecDecoderStats stats_;
 
-    // TODO(M4.2): deque<PacketBuffer> 就够 —— 按到达顺序 push_back, 超过 recentPackets
-    //   就 pop_front, 查找时线性扫比对 seq。几十条的规模, 别上 map:
-    //   本来就要为每一组扫一遍组内成员, map 省不下什么。
+    // 按到达顺序保留整包；几十条的规模下线性扫描比 map 更简单。
     std::deque<PacketBuffer> recent_;
 };

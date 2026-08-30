@@ -17,7 +17,7 @@ bool shouldDropPacket(const LossConfig& config, uint32_t seq, PacketType type,
     //   1. 没开启 -> false
     //   2. isRetransmit -> false   (在算哈希之前就短路, 见头文件的理由)
     //   3. lossPercent >= 100 -> true
-    //   4. 把 (seed, seq) 混成一个 32 位值, 取模 100 与 lossPercent 比较
+    //   4. 把 (seed, type, seq) 混成一个 32 位值, 取模 100 与 lossPercent 比较
     //
     // 第 4 步的混合函数要满足两条, 都能被测试证伪:
     //   - 相邻 seq 的结果不能相关。seq 是 +1 递增的, 用 (seed + seq) % 100 这种
@@ -32,11 +32,7 @@ bool shouldDropPacket(const LossConfig& config, uint32_t seq, PacketType type,
     if (isRetransmit) return false;
     if (config.lossPercent >= 100) return true;
 
-    // TODO(M4.2): type 必须参与混合 —— DATA 和 FEC 各有自己的 seq 计数器,
-    //   只用 (seed, seq) 的话 FEC#3 和 DATA#3 会逐位同丢同留(见头文件的 @note)。
-    //   拌进去就行, 比如 seq ^= static_cast<uint32_t>(type) * 0x9E3779B9u,
-    //   或者塞进 mixed 的空位 —— 只要不同 type 落在不同的键空间。
-    (void)type;
+    seq ^= static_cast<uint32_t>(type) * 0x9E3779B9u;
     uint64_t mixed = (static_cast<uint64_t>(config.seed) << 32) | seq;
     mixed += 0x9E3779B97F4A7C15ull;
     mixed = (mixed ^ (mixed >> 30)) * 0xBF58476D1CE4E5B9ull;

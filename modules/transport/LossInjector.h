@@ -6,7 +6,7 @@
  *
  * @note **这是测试工具, 不是业务功能。** 默认必须是不生效的(见 LossConfig::seed)。
  *
- * @note 为什么是自由函数而不是类: 丢不丢完全由 (seed, seq) 决定, 没有任何需要
+ * @note 为什么是自由函数而不是类: 丢不丢完全由 (seed, type, seq) 决定, 没有任何需要
  *          记住的东西。无状态因此也无需考虑线程安全 —— 收包线程直接调。
  */
 #pragma once
@@ -59,7 +59,7 @@ bool lossInjectionEnabled(const LossConfig& config);
  * @return true 表示调用方应当**当作没收到**这个包 —— 直接返回, 不要交给
  *         FrameAssembler, 也不要计入任何真实统计
  *
- * @note **纯函数**: 同样的 (seed, seq) 永远给同样的答案, 与到达顺序、与之前
+ * @note **纯函数**: 同样的 (seed, type, seq) 永远给同样的答案, 与到达顺序、与之前
  *          调过多少次、与是否有重传包插队全都无关。
  *
  *          这一条是整个注入器存在的意义。反面写法是"持有一个 mt19937, 每来一个包

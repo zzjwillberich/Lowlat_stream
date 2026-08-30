@@ -307,27 +307,63 @@ Status decodeNackPacket(const uint8_t* buf, size_t bufLen, std::vector<uint32_t>
 }
 
 Status encodeFecHeader(const FecHeader& header, uint8_t* buf, size_t bufLen) {
-    // TODO(M4.2): 逐字段按偏移写, 全部网络序:
-    //   0  4  groupBaseSeq   4  2  groupSize
-    //   6  2  payloadLenXor  8  1  groupIndex
-    //   9  1  groupCount    10  2  reserved
-    //   校验: buf 非空, bufLen >= FEC_HEADER_SIZE, groupSize >= 2 -> 否则 InvalidArg
-    //   groupSize 在**编码时**就查, 同 encodePacketHeader 查 type 的理由 ——
-    //   本端写出一个 groupSize=1 的 FEC 包, 现象是"对端一直不恢复", 排查方向指向对端。
-    (void)header;
-    (void)buf;
-    (void)bufLen;
-    return Status::error(Code::Internal, "encodeFecHeader: not implemented");
+    if (buf == nullptr) {
+        return Status::error(Code::InvalidArg, "encodeFecHeader: buf must not be null");
+    }
+    if (bufLen < FEC_HEADER_SIZE) {
+        return Status::error(Code::InvalidArg,
+                             "encodeFecHeader: buffer is smaller than FEC_HEADER_SIZE");
+    }
+    if (header.groupSize < 2) {
+        return Status::error(Code::InvalidArg,
+                             "encodeFecHeader: groupSize must be at least 2");
+    }
+
+    const uint32_t groupBaseSeqNet = htonl(header.groupBaseSeq);
+    const uint16_t groupSizeNet = htons(header.groupSize);
+    const uint16_t payloadLenXorNet = htons(header.payloadLenXor);
+    const uint16_t reservedNet = htons(header.reserved);
+
+    std::memcpy(buf, &groupBaseSeqNet, sizeof(groupBaseSeqNet));
+    std::memcpy(buf + 4, &groupSizeNet, sizeof(groupSizeNet));
+    std::memcpy(buf + 6, &payloadLenXorNet, sizeof(payloadLenXorNet));
+    buf[8] = header.groupIndex;
+    buf[9] = header.groupCount;
+    std::memcpy(buf + 10, &reservedNet, sizeof(reservedNet));
+    return Status::ok();
 }
 
 Status decodeFecHeader(const uint8_t* buf, size_t bufLen, FecHeader& out) {
-    // TODO(M4.2): 同 decodeDataHeader 的形状 —— 先写局部变量, 全部校验通过再整体赋给出参,
-    //   失败时不留下半解析的垃圾字段。
-    //   buf 为空 / bufLen 不足 -> InvalidArg (本端调用错误)
-    //   groupSize < 2          -> NetError   (对端或网络的问题, 丢包 + 计数)
-    //   reserved 非 0          -> **照常解析**, 不算畸形
-    (void)buf;
-    (void)bufLen;
-    (void)out;
-    return Status::error(Code::Internal, "decodeFecHeader: not implemented");
+    if (buf == nullptr) {
+        return Status::error(Code::InvalidArg, "decodeFecHeader: buf must not be null");
+    }
+    if (bufLen < FEC_HEADER_SIZE) {
+        return Status::error(Code::InvalidArg,
+                             "decodeFecHeader: buffer is smaller than FEC_HEADER_SIZE");
+    }
+
+    uint32_t groupBaseSeqNet;
+    uint16_t groupSizeNet;
+    uint16_t payloadLenXorNet;
+    uint16_t reservedNet;
+    std::memcpy(&groupBaseSeqNet, buf, sizeof(groupBaseSeqNet));
+    std::memcpy(&groupSizeNet, buf + 4, sizeof(groupSizeNet));
+    std::memcpy(&payloadLenXorNet, buf + 6, sizeof(payloadLenXorNet));
+    std::memcpy(&reservedNet, buf + 10, sizeof(reservedNet));
+
+    const uint16_t groupSize = ntohs(groupSizeNet);
+    if (groupSize < 2) {
+        return Status::error(Code::NetError,
+                             "decodeFecHeader: received groupSize is smaller than 2");
+    }
+
+    FecHeader decoded;
+    decoded.groupBaseSeq = ntohl(groupBaseSeqNet);
+    decoded.groupSize = groupSize;
+    decoded.payloadLenXor = ntohs(payloadLenXorNet);
+    decoded.groupIndex = buf[8];
+    decoded.groupCount = buf[9];
+    decoded.reserved = ntohs(reservedNet);
+    out = decoded;
+    return Status::ok();
 }
