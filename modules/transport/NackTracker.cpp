@@ -13,7 +13,14 @@
 
 NackTracker::NackTracker(NackTrackerConfig config) : config_(std::move(config)) {}
 
-void NackTracker::onPacket(uint32_t seq, uint16_t fragCount) {
+void NackTracker::onPacket(uint32_t seq, uint16_t fragCount, bool isKey) {
+    // TODO(M4.4): 登记缺口时把 isKey 记进 GapState::likelyKeyFrame ——
+    //   "揭示这个缺口的那个包"就是当前这个包(它的 seq 比缺口新)。
+    //   放弃缺口时(givenUp 那两处: 滑出窗口 和 请求次数用完),
+    //   likelyKeyFrame 为真就 ++stats_.keyFramesGivenUp。
+    //   两处都要加, 漏一处的现象是"丢包一多 PLI 就不发了"——
+    //   因为丢得越多越容易走"滑出窗口"那条路。
+    (void)isKey;
     // 按以下顺序更新:
     //   1. ++stats_.packetsSeen
     //   2. 更新乱序容忍 = clamp(fragCount, minReorderPackets, maxReorderPackets)

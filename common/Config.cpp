@@ -35,7 +35,7 @@ namespace {
             // M4 弱网对抗参数
             || key == "loss" || key == "seed"
             || key == "nack-window" || key == "nack-retries" || key == "retx-ms"
-            || key == "fec-group" || key == "fec-recent";
+            || key == "fec-group" || key == "fec-recent" || key == "pli-ms";
     }
 }
 
@@ -235,5 +235,7 @@ void Config::printUsage() const {
         "                        0 disables FEC (default: 4)\n"
         "  --fec-recent <n>      Receiver packets kept for FEC recovery;\n"
         "                        0 disables FEC decoding (default: 64)\n"
+        "  --pli-ms <ms>         Receiver min interval between key-frame requests;\n"
+        "                        0 disables PLI (default: 1000)\n"
     );
 }

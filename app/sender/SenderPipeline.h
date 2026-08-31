@@ -158,6 +158,14 @@ struct SenderPipelineStats {
     uint64_t reverseMalformed = 0;
 
     /**
+     * @brief 收到的 PLI 包数 (M4.4)
+     *
+     * @note 和 nacksReceived 分开: 一个要的是"重发某几个包", 一个要的是"立刻出一个 IDR",
+     *          代价差一个数量级(一个包 vs 25 个包)。混成一个数就看不出对端到底有多绝望。
+     */
+    uint64_t plisReceived = 0;
+
+    /**
      * @brief FEC 编码器的计数器快照 (M4.2)
      *
      * @note `fec.fecBytes / encodedBytes` 就是**实测的冗余开销**。这个数要和

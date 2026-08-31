@@ -6,6 +6,7 @@
  */
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <vector>
@@ -135,6 +136,25 @@ public:
     Status encode(const RawFrame& in, std::vector<EncodedFrame>& out);
 
     /**
+     * @brief 请求下一帧编成关键帧 (M4.4 PLI)
+     *
+     * @note **线程安全**: 内部是一个 atomic 标志。发送线程收到 PLI 时调它,
+     *          编码线程在下一次 encode() 时消费 —— 两条线程不需要额外同步,
+     *          也不需要把 PLI 一路传到编码线程去。
+     *
+     * @note 只影响**下一帧**, 之后回到正常的 gop 节奏。连着调多次和调一次等效
+     *          (标志被消费一次就清掉) —— 这一条让上层的限流不必做得很精确。
+     *
+     * @note 实现上是给下一个 AVFrame 置 `pict_type = AV_PICTURE_TYPE_I`。
+     *          **不要**改 `ctx_->gop_size` 或者重开编码器: 前者对已经打开的
+     *          x264 不生效, 后者会重置码率控制状态, 画质会抖一下。
+     *
+     * @note 这个请求**不保证**下一帧一定是 IDR —— 编码器有最终决定权。
+     *          调用方要靠 EncodedFrame::isKey 确认, 不能假设"调了就有"。
+     */
+    void requestKeyFrame();
+
+    /**
      * @brief 冲刷编码器内部缓存
      *
      * @param out 出参, 追加剩余的码流帧
@@ -187,4 +207,13 @@ private:
      *          编码器就会报错或丢帧。这里自己数, 帧号通过 pending_ 关联回去。
      */
     int64_t nextPts_ = 0;
+
+    /**
+     * @brief M4.4: 下一帧要不要强制成关键帧
+     *
+     * @note atomic 是**必需**的, 不是防御性写法: 发送线程(收 PLI)写、编码线程读,
+     *          这是真正的跨线程共享。用普通 bool 就是数据竞争(UB), 编译器可以把它
+     *          缓存进寄存器, 现象是"PLI 收到了但一直不出 IDR"而且只在 Release 下出现。
+     */
+    std::atomic<bool> keyFrameRequested_{false};
 };

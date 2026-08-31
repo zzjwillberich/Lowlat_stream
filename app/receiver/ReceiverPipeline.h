@@ -128,6 +128,25 @@ struct ReceiverPipelineConfig {
      *          不用的话是纯浪费。"关掉 = 那一级完全不存在", 同 renderKind 为空。
      */
     FecDecoderConfig fec;
+
+    /**
+     * @brief 两次 PLI 之间的最小间隔(毫秒); 0 表示**不发 PLI** (M4.4)
+     *
+     * @note **限流不是可选项, 是 PLI 唯一真正危险的地方。** 一个 IDR 约 25 片,
+     *          10% 丢包下完整到达的概率只有 0.9^25 = 7.2%:
+     *
+     *          ```text
+     *          关键帧丢了 -> PLI -> IDR(25 片) -> 92.8% 又收不齐 -> 再 PLI -> ...
+     *          ```
+     *
+     *          每一轮都往已经拥堵的网络里再灌 25 个包, 而 IDR 比 P 帧大一个数量级 ——
+     *          丢包越严重, PLI 越频繁, 网络越差。这是自我强化的死循环。
+     *          RTP 那边的惯例是 1 秒, 这里取同一个量级。
+     *
+     * @note 两个触发源(保险丝烧了 / NACK 放弃了关键帧分片)**共用同一个限流器** ——
+     *          否则一次拥塞可能同时触发两边, 一下发出两个 PLI。
+     */
+    int pliMinIntervalMs = 1000;
 };
 
 /**
@@ -248,6 +267,19 @@ struct ReceiverPipelineStats {
      *          没有它的话, "NACK 一条都没生效"会有两种原因而你分不清。
      */
     uint64_t nackSendErrors = 0;
+
+    /** @brief 实际发出去的 PLI 包数 (M4.4) */
+    uint64_t pliSent = 0;
+
+    /**
+     * @brief 触发了但被最小间隔挡下的 PLI 次数
+     *
+     * @note 单独一个字段, 因为它回答的是"限流有没有在起作用"。它远大于 pliSent
+     *          说明触发源太敏感或者网络已经烂到 IDR 根本收不齐 —— 那时再发也没用。
+     *          没有这个数的话, "PLI 只发了 2 个"有两种意思: 只触发了 2 次, 还是
+     *          触发了 200 次被挡掉 198 次。
+     */
+    uint64_t pliSuppressed = 0;
 
     uint64_t elapsedMs = 0;
 };
@@ -428,6 +460,28 @@ private:
      */
     void requestRetransmissions(const uint8_t* packet, size_t len);
 
+    /**
+     * @brief M4.4: 请求对端立刻编一个关键帧
+     *
+     * @param nowMs 当前 steady 时刻, 用于最小间隔限流
+     *
+     * @return true 真的发出去了; false 被限流挡下或者还没见过对端
+     *
+     * @note 两个触发源共用这一个函数, 因此也共用同一个限流器:
+     *          - **保险丝烧了**: queueA 满 -> dropUntilKeyFrame() -> 画面已经冻结,
+     *            正在等下一个 IDR, 主动要一个能把冻结时间从"最长一个 GOP"缩短;
+     *          - **NACK 放弃了关键帧分片**: nackTracker_ 的 keyFramesGivenUp 涨了 ——
+     *            重传已经尽力还是没救回来, 那一帧永远拼不齐, 后面依赖它的帧全会花。
+     *
+     * @note PLI 包**没有载荷**, 就是一个 type = Pli 的通用头。seq 用 nackSeq_ 同一个
+     *          计数器 —— 它俩都是本端往反向通道上发的包, 各数各的没有意义。
+     *
+     * @note **PLI 是第三道兜底, 不该是第一反应。** FEC 和 NACK 已经在保护 IDR 了
+     *          (实测只开 NACK 时 10% 丢包下 rendered=299/300)。触发源写得太敏感,
+     *          换来的是 IDR 风暴而不是更快恢复。
+     */
+    bool requestKeyFrame(uint64_t nowMs);
+
     /** @brief 队列 A -> Decoder -> 队列 B */
     void decodeLoop(const std::atomic<bool>& stopRequested);
 
@@ -581,6 +635,21 @@ private:
     /** @brief M4.1 统计, 收包线程独占写 */
     std::atomic<uint64_t> nackPacketsSent_{0};
     std::atomic<uint64_t> nackSendErrors_{0};
+
+    /** @brief M4.4 上一次真正发出 PLI 的时刻; 0 表示还没发过 */
+    uint64_t lastPliMs_ = 0;
+
+    /**
+     * @brief M4.4 已经因为关键帧分片放弃而触发过 PLI 的次数
+     *
+     * @note 用来把 NackTrackerStats::keyFramesGivenUp 的**增量**变成边沿触发 ——
+     *          那是个累计值, 直接判"非 0 就发"会每个包都发一次。
+     */
+    uint64_t seenKeyFramesGivenUp_ = 0;
+
+    /** @brief M4.4 统计, 收包线程独占写 */
+    std::atomic<uint64_t> pliSent_{0};
+    std::atomic<uint64_t> pliSuppressed_{0};
 
     std::ofstream h264File_;
     ReceiverPipelineStats stats_;

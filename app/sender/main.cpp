@@ -93,7 +93,7 @@ int main(int argc, char** argv) {
              "stopped: captured=%llu encoded=%llu bytes=%llu key=%llu "
              "queue_peak=%zu send_queue_peak=%zu packets_sent=%llu send_errors=%llu "
              "nacks=%llu nacked_seqs=%llu retransmitted=%llu retx_misses=%llu "
-             "reverse_malformed=%llu fec_packets=%llu fec_bytes=%llu elapsed=%llums",
+             "reverse_malformed=%llu plis=%llu fec_packets=%llu fec_bytes=%llu elapsed=%llums",
              static_cast<unsigned long long>(stats.capturedFrames),
              static_cast<unsigned long long>(stats.encodedFrames),
              static_cast<unsigned long long>(stats.encodedBytes),
@@ -105,6 +105,7 @@ int main(int argc, char** argv) {
              static_cast<unsigned long long>(stats.packetsRetransmitted),
              static_cast<unsigned long long>(stats.retransmitMisses),
              static_cast<unsigned long long>(stats.reverseMalformed),
+             static_cast<unsigned long long>(stats.plisReceived),
              static_cast<unsigned long long>(stats.fec.fecPacketsBuilt),
              static_cast<unsigned long long>(stats.fec.fecBytes),
              static_cast<unsigned long long>(stats.elapsedMs));

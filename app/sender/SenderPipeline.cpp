@@ -391,6 +391,15 @@ void SenderPipeline::drainReverseChannel() {
         }
         ++packetsProcessed;
 
+        // TODO(M4.4): 反向通道现在有两种包了, 这里要先按类型分流。
+        //   decodePacketHeader 拿到 type:
+        //     Pli  -> ++stats_.plisReceived; encoder_.requestKeyFrame(); continue;
+        //             **就这两行** —— requestKeyFrame 内部只置一个 atomic,
+        //             编码线程下一次 encode 时消费。不要在这条线程上碰编码器的其它东西。
+        //             PLI 没有载荷, 长度就是 PACKET_HEADER_SIZE, 多出来的字节算畸形。
+        //     Nack -> 现在这段
+        //     其它 -> ++stats_.reverseMalformed; continue;
+        //   包头都解不出来的也归 reverseMalformed —— 端口上收到垃圾是常态。
         if (!decodeNackPacket(reverseBuf_.data(), receivedBytes, nackedSeqs_)
                  .isOk()) {
             ++stats_.reverseMalformed;

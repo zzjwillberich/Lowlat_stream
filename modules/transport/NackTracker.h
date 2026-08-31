@@ -81,6 +81,17 @@ struct NackTrackerStats {
     uint64_t givenUp = 0;
 
     /**
+     * @brief givenUp 里**疑似属于关键帧**的那部分 (M4.4)
+     *
+     * @note 这是 PLI 的触发信号: NACK 已经尽力了还是没救回来, 而丢的又是关键帧分片
+     *          —— 那一帧拼不齐, 后面所有依赖它的帧都会花, 只能请求一个新的 IDR。
+     *
+     * @note "疑似"两个字是认真的: 见 onPacket 的 @note, 这是从缺口邻居推断的。
+     *          宁可多判(多发一个 PLI, 浪费一个 IDR)也不要少判(画面一直花着)。
+     */
+    uint64_t keyFramesGivenUp = 0;
+
+    /**
      * @brief 精确丢包数: 至今没收到、且已经放弃的 seq 数
      *
      * @note 和 AssemblerStats::packetsLost() 的区别就是这个类存在的理由之一:
@@ -141,6 +152,14 @@ public:
      *
      * @param seq       PacketHeader::seq
      * @param fragCount DataHeader::fragCount, 用来自适应乱序容忍
+     * @param isKey     这一片是不是关键帧的分片(DataHeader::FLAG_KEYFRAME)
+     *
+     * @note isKey 是给 M4.4 的 PLI 用的, 而它必须**启发式**地推断:
+     *          丢掉的那个包接收端根本没收到, **无从知道它是不是关键帧分片**。
+     *          做法是登记缺口时把"揭示这个缺口的那个包"的 isKey 记下来 ——
+     *          seq 在一帧内是连续的, 所以缺口两侧的包极大概率和它同帧。
+     *          这个推断在"分片连续"这个前提下相当可靠, 但它**是推断不是事实**,
+     *          所以只用来触发 PLI(发多了顶多浪费一个 IDR), 不用来做任何统计口径。
      *
      * @note **第一个包只建立基线, 不产生任何缺口。** 接收端从流的中间接进来是常态
      *          (对端已经跑了一会儿), 第一个 seq 是 5000 的话, 绝不能把 0..4999
@@ -167,7 +186,7 @@ public:
      *          阈值取 windowPackets 而不是另立一个: 窗口外的包本来就救不回来
      *          (重传赶不上 playAt), 跳过一整个窗口意味着连续性已经没有意义了。
      */
-    void onPacket(uint32_t seq, uint16_t fragCount);
+    void onPacket(uint32_t seq, uint16_t fragCount, bool isKey);
 
     /**
      * @brief 取出这一轮应当请求重传的 seq
@@ -199,6 +218,9 @@ private:
     struct GapState {
         int requestCount = 0;
         uint32_t lastRequestAtHighestSeq = 0;
+
+        /** @brief 揭示这个缺口的那个包是不是关键帧分片; 见 onPacket 的 @note */
+        bool likelyKeyFrame = false;
     };
 
     NackTrackerConfig config_;

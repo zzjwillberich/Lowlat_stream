@@ -30,7 +30,7 @@ namespace {
 
     /** 顺序喂 [from, to) 这一段 seq */
     void feedRange(NackTracker& t, uint32_t from, uint32_t to) {
-        for (uint32_t s = from; s != to; ++s) t.onPacket(s, FRAGS_PER_FRAME);
+        for (uint32_t s = from; s != to; ++s) t.onPacket(s, FRAGS_PER_FRAME, false);
     }
 
     /** 顺序喂 [from, to), 但跳过 skip 里列出的 seq */
@@ -38,7 +38,7 @@ namespace {
                            const std::vector<uint32_t>& skip) {
         for (uint32_t s = from; s != to; ++s) {
             if (std::find(skip.begin(), skip.end(), s) != skip.end()) continue;
-            t.onPacket(s, FRAGS_PER_FRAME);
+            t.onPacket(s, FRAGS_PER_FRAME, false);
         }
     }
 
@@ -58,7 +58,7 @@ namespace {
  */
 TEST(NackTracker, TheFirstPacketOnlyEstablishesABaseline) {
     NackTracker tracker(config());
-    tracker.onPacket(5000, FRAGS_PER_FRAME);
+    tracker.onPacket(5000, FRAGS_PER_FRAME, false);
     EXPECT_TRUE(collect(tracker).empty()) << "把接入之前的 seq 全当成丢包了";
     EXPECT_EQ(tracker.stats().pending, 0u);
     EXPECT_EQ(tracker.stats().lostForReal, 0u);
@@ -82,8 +82,8 @@ TEST(NackTracker, AContiguousStreamProducesNoRequests) {
 TEST(NackTracker, AFreshGapIsNotRequestedYet) {
     NackTracker tracker(config());
     feedRange(tracker, 100, 105);
-    tracker.onPacket(106, FRAGS_PER_FRAME);  // 跳过 105
-    tracker.onPacket(107, FRAGS_PER_FRAME);
+    tracker.onPacket(106, FRAGS_PER_FRAME, false);  // 跳过 105
+    tracker.onPacket(107, FRAGS_PER_FRAME, false);
     EXPECT_TRUE(collect(tracker).empty()) << "缺口才隔 2 个包就报, 乱序会被当成丢包";
     EXPECT_EQ(tracker.stats().pending, 1u) << "缺口本身要记下来";
 }
@@ -107,9 +107,9 @@ TEST(NackTracker, AGapIsRequestedAfterAFrameWorthOfNewerPackets) {
 TEST(NackTracker, ALateArrivalClosesTheGapAndStopsRequests) {
     NackTracker tracker(config());
     feedRange(tracker, 100, 105);
-    tracker.onPacket(106, FRAGS_PER_FRAME);
-    tracker.onPacket(107, FRAGS_PER_FRAME);
-    tracker.onPacket(105, FRAGS_PER_FRAME);  // 迟到, 但还没被请求过
+    tracker.onPacket(106, FRAGS_PER_FRAME, false);
+    tracker.onPacket(107, FRAGS_PER_FRAME, false);
+    tracker.onPacket(105, FRAGS_PER_FRAME, false);  // 迟到, 但还没被请求过
 
     feedRange(tracker, 108, 108 + 3 * FRAGS_PER_FRAME);
     EXPECT_TRUE(collect(tracker).empty()) << "缺口已经补上了还在请求";
@@ -126,7 +126,7 @@ TEST(NackTracker, ARetransmissionAfterARequestCountsAsRecovered) {
     feedRangeSkipping(tracker, 105, 105 + 2 * FRAGS_PER_FRAME, {105});
     ASSERT_EQ(collect(tracker).size(), 1u);
 
-    tracker.onPacket(105, FRAGS_PER_FRAME);  // 重传包到了
+    tracker.onPacket(105, FRAGS_PER_FRAME, false);  // 重传包到了
     EXPECT_EQ(tracker.stats().recovered, 1u);
     EXPECT_EQ(tracker.stats().pending, 0u);
     EXPECT_EQ(tracker.stats().lostForReal, 0u) << "救回来了就不算丢";
@@ -220,7 +220,7 @@ TEST(NackTracker, ThePendingSetStaysBoundedUnderHeavyLoss) {
     // 每 3 个只收 1 个, 连续两万个包
     for (uint32_t s = 0; s < 20000; ++s) {
         if (s % 3 != 0) continue;
-        tracker.onPacket(s, FRAGS_PER_FRAME);
+        tracker.onPacket(s, FRAGS_PER_FRAME, false);
         (void)collect(tracker);
         ASSERT_LE(tracker.stats().pending, cfg.windowPackets)
             << "seq=" << s << " 时缺口表已经超过窗口";
@@ -233,7 +233,7 @@ TEST(NackTracker, DuplicatePacketsAreNotCountedAsRecovery) {
     NackTracker tracker(config());
     feedRange(tracker, 100, 120);
     const uint64_t before = tracker.stats().recovered;
-    for (int i = 0; i < 5; ++i) tracker.onPacket(110, FRAGS_PER_FRAME);
+    for (int i = 0; i < 5; ++i) tracker.onPacket(110, FRAGS_PER_FRAME, false);
     EXPECT_EQ(tracker.stats().recovered, before) << "重复包不是'救回来的'";
     EXPECT_EQ(tracker.stats().pending, 0u);
 }
@@ -266,7 +266,7 @@ TEST(NackTracker, ResetForgetsEverything) {
     EXPECT_TRUE(collect(tracker).empty());
 
     // reset 之后第一个包重新建立基线, 不能把新流的开头判成缺口
-    tracker.onPacket(90000, FRAGS_PER_FRAME);
+    tracker.onPacket(90000, FRAGS_PER_FRAME, false);
     EXPECT_TRUE(collect(tracker).empty());
 }
 
@@ -291,7 +291,7 @@ TEST(NackTracker, AHugeSeqJumpIsTreatedAsANewStreamNotAsMassiveLoss) {
     ASSERT_EQ(tracker.stats().lostForReal, 0u);
     ASSERT_EQ(tracker.stats().pending, 0u);
 
-    tracker.onPacket(1100u + 1000000000u, FRAGS_PER_FRAME);
+    tracker.onPacket(1100u + 1000000000u, FRAGS_PER_FRAME, false);
 
     EXPECT_EQ(tracker.stats().lostForReal, 0u) << "把一次流中断记成了十亿个丢包";
     EXPECT_EQ(tracker.stats().givenUp, 0u);
@@ -308,7 +308,7 @@ TEST(NackTracker, TrackingResumesNormallyAfterADiscontinuity) {
 
     feedRange(tracker, 1000, 1100);
     const uint32_t newBase = 1100u + 1000000000u;
-    tracker.onPacket(newBase, FRAGS_PER_FRAME);
+    tracker.onPacket(newBase, FRAGS_PER_FRAME, false);
     ASSERT_EQ(tracker.stats().discontinuities, 1u);
 
     // 新流上正常丢一个包, 应当照常被检出
@@ -329,10 +329,82 @@ TEST(NackTracker, AJumpJustUnderTheWindowIsStillCountedAsLoss) {
     cfg.maxRequestsPerSeq = 100;
     NackTracker tracker(cfg);
 
-    tracker.onPacket(1000, FRAGS_PER_FRAME);
-    tracker.onPacket(1000 + 255, FRAGS_PER_FRAME);  // 跳 255 < 256
+    tracker.onPacket(1000, FRAGS_PER_FRAME, false);
+    tracker.onPacket(1000 + 255, FRAGS_PER_FRAME, false);  // 跳 255 < 256
 
     EXPECT_EQ(tracker.stats().discontinuities, 0u) << "窗口以内的跳号是真丢包, 不是换流";
     EXPECT_GT(tracker.stats().pending + tracker.stats().lostForReal, 0u)
         << "254 个中间的包被静默吞掉了";
+}
+
+// ---------- M4.4: 关键帧分片的放弃是 PLI 的触发信号 ----------
+
+namespace {
+    /** 顺序喂 [from, to), 跳过 skip; 全部标成关键帧分片 */
+    void feedKeyRangeSkipping(NackTracker& t, uint32_t from, uint32_t to,
+                              const std::vector<uint32_t>& skip) {
+        for (uint32_t s = from; s != to; ++s) {
+            if (std::find(skip.begin(), skip.end(), s) != skip.end()) continue;
+            t.onPacket(s, FRAGS_PER_FRAME, true);
+        }
+    }
+}  // namespace
+
+/**
+ * 丢掉的那个包接收端根本没收到，**无从知道它是不是关键帧分片**。
+ * 做法是把"揭示这个缺口的那个包"的 isKey 记下来——seq 在一帧内连续，
+ * 所以缺口两侧的包极大概率同帧。这是推断不是事实，所以只拿来触发 PLI。
+ */
+TEST(NackTracker, GivingUpAKeyFrameFragmentIsReportedSeparately) {
+    NackTrackerConfig cfg = config();
+    cfg.maxRequestsPerSeq = 1;  // 请求一次就放弃, 缩短用例
+    NackTracker tracker(cfg);
+
+    feedKeyRangeSkipping(tracker, 100, 100 + 3 * FRAGS_PER_FRAME, {105});
+    ASSERT_EQ(collect(tracker).size(), 1u);  // 第一次请求后立刻放弃
+
+    EXPECT_EQ(tracker.stats().givenUp, 1u);
+    EXPECT_EQ(tracker.stats().keyFramesGivenUp, 1u)
+        << "关键帧分片放弃了却没报出来 —— PLI 的触发信号就没了";
+}
+
+TEST(NackTracker, GivingUpANonKeyFragmentDoesNotTriggerTheKeyFrameCounter) {
+    NackTrackerConfig cfg = config();
+    cfg.maxRequestsPerSeq = 1;
+    NackTracker tracker(cfg);
+
+    feedRangeSkipping(tracker, 100, 100 + 3 * FRAGS_PER_FRAME, {105});  // isKey = false
+    ASSERT_EQ(collect(tracker).size(), 1u);
+
+    EXPECT_EQ(tracker.stats().givenUp, 1u);
+    EXPECT_EQ(tracker.stats().keyFramesGivenUp, 0u)
+        << "P 帧分片也触发 PLI 的话, 一有丢包就会不停要 IDR";
+}
+
+/**
+ * 两条 givenUp 路径都要计：请求次数用完，和滑出窗口。
+ * 漏掉后者的现象是"丢包一多 PLI 反而不发了"——因为丢得越多越容易走滑出窗口那条。
+ */
+TEST(NackTracker, KeyFramesGivenUpCountsTheWindowEvictionPathToo) {
+    NackTrackerConfig cfg = config();
+    cfg.windowPackets = 64;
+    cfg.maxRequestsPerSeq = 100;  // 堵死"请求次数用完"这条路
+    NackTracker tracker(cfg);
+
+    feedKeyRangeSkipping(tracker, 1000, 1000 + 500, {1005});
+    (void)collect(tracker);
+
+    EXPECT_GE(tracker.stats().givenUp, 1u);
+    EXPECT_GE(tracker.stats().keyFramesGivenUp, 1u)
+        << "只在'请求用完'那条路上计, 丢包一多 PLI 就不发了";
+}
+
+TEST(NackTracker, RecoveredKeyFragmentsAreNotCountedAsGivenUp) {
+    NackTracker tracker(config());
+    feedKeyRangeSkipping(tracker, 100, 100 + 2 * FRAGS_PER_FRAME, {105});
+    ASSERT_EQ(collect(tracker).size(), 1u);
+
+    tracker.onPacket(105, FRAGS_PER_FRAME, true);  // 重传回来了
+    EXPECT_EQ(tracker.stats().recovered, 1u);
+    EXPECT_EQ(tracker.stats().keyFramesGivenUp, 0u) << "救回来了还要 IDR, 那是白发";
 }

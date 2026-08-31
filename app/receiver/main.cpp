@@ -63,6 +63,9 @@ namespace {
             static_cast<size_t>(std::max(0, config.getInt("nack-window", 1024)));
         pipeline.nack.maxRequestsPerSeq = config.getInt("nack-retries", 3);
 
+        // M4.4 PLI。--pli-ms=0 关掉；否则是两次关键帧请求的最小间隔。
+        pipeline.pliMinIntervalMs = config.getInt("pli-ms", 1000);
+
         // M4.2 FEC 解码。--fec-recent=0 关掉。
         pipeline.fec.recentPackets =
             static_cast<size_t>(std::max(0, config.getInt("fec-recent", 64)));
@@ -110,7 +113,8 @@ int main(int argc, char** argv) {
              "queue_dropped=%llu resyncs=%llu injected_drops=%llu "
              "nack_sent=%llu nack_seqs=%llu nack_recovered=%llu nack_gaveup=%llu "
              "lost_exact=%llu nack_pending=%zu "
-             "fec_recv=%llu fec_recovered=%llu fec_unrecoverable=%llu decoded=%llu "
+             "fec_recv=%llu fec_recovered=%llu fec_unrecoverable=%llu "
+             "pli_sent=%llu pli_suppressed=%llu decoded=%llu "
              "rendered=%llu queue_peak=%zu/%zu elapsed=%llums",
              static_cast<unsigned long long>(stats.framesWritten),
              static_cast<unsigned long long>(stats.bytesWritten),
@@ -136,6 +140,8 @@ int main(int argc, char** argv) {
              static_cast<unsigned long long>(stats.fec.fecPacketsReceived),
              static_cast<unsigned long long>(stats.fec.groupsRecovered),
              static_cast<unsigned long long>(stats.fec.groupsUnrecoverable),
+             static_cast<unsigned long long>(stats.pliSent),
+             static_cast<unsigned long long>(stats.pliSuppressed),
              static_cast<unsigned long long>(stats.decoder.framesOut),
              static_cast<unsigned long long>(stats.renderer.framesRendered),
              stats.decodeQueuePeak, stats.renderQueuePeak,

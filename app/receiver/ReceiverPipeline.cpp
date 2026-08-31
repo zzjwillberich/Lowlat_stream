@@ -281,8 +281,10 @@ void ReceiverPipeline::recvLoop(const std::atomic<bool>& stopRequested) {
                                     recoveredBuf_.size() - PACKET_HEADER_SIZE,
                                     recoveredDataHeader)
                                     .isOk()) {
-                                nackTracker_.onPacket(recoveredHeader.seq,
-                                                      recoveredDataHeader.fragCount);
+                                nackTracker_.onPacket(
+                                    recoveredHeader.seq, recoveredDataHeader.fragCount,
+                                    (recoveredDataHeader.flags &
+                                     DataHeader::FLAG_KEYFRAME) != 0);
                             }
                         }
                         (void)assembler_.offer(recoveredBuf_.data(), recoveredBuf_.size());
@@ -327,6 +329,9 @@ void ReceiverPipeline::recvLoop(const std::atomic<bool>& stopRequested) {
                 ++decodeResyncs_;
                 queueA_.clear();
                 jitter_.dropUntilKeyFrame();
+                // TODO(M4.4) 触发源 B: 保险丝烧了 —— 画面已经冻结, 正在等下一个 IDR。
+                //   主动 requestKeyFrame(now) 能把冻结时间从"最长一个 GOP"缩短。
+                //   下面那处 dropUntilKeyFrame() 也要加, 两处是同一件事的两条路径。
                 break;
             }
         }
@@ -354,6 +359,7 @@ void ReceiverPipeline::recvLoop(const std::atomic<bool>& stopRequested) {
             ++decodeResyncs_;
             queueA_.clear();
             jitter_.dropUntilKeyFrame();
+            // TODO(M4.4) 触发源 B 的第二条路径; 同上面那处
         }
         // 正常 EOF 要把已入队数据和 Decoder 的内部缓存顺序排空；异常/用户停止仍走
         // requestStop()，立即关闭两条队列以唤醒所有阻塞点。
@@ -537,6 +543,8 @@ void ReceiverPipeline::publishRecvStats() {
     shared_.fec = fecDecoder_.stats();
     shared_.nackPacketsSent = nackPacketsSent_.load();
     shared_.nackSendErrors = nackSendErrors_.load();
+    shared_.pliSent = pliSent_.load();
+    shared_.pliSuppressed = pliSuppressed_.load();
 }
 
 void ReceiverPipeline::trackPeer(const uint8_t* packet, size_t len, const Endpoint& from) {
@@ -566,6 +574,24 @@ void ReceiverPipeline::trackPeer(const uint8_t* packet, size_t len, const Endpoi
     peer_ = from;
 }
 
+bool ReceiverPipeline::requestKeyFrame(uint64_t nowMs) {
+    // TODO(M4.4):
+    //   1. config_.pliMinIntervalMs <= 0 -> return false  (关掉 PLI, 零开销)
+    //   2. peer_.port == 0 -> return false                (还没见过对端)
+    //   3. 限流: lastPliMs_ != 0 且 nowMs - lastPliMs_ < pliMinIntervalMs
+    //      -> ++pliSuppressed_, return false
+    //      **注意 nowMs < lastPliMs_ 的情况**(不该发生, 但无符号减法会回绕成天文数字,
+    //      让限流永远不触发, 变成 PLI 风暴 —— 同 RetransmitCache::evictExpired 那条)
+    //   4. 组包: PacketHeader{type = Pli, streamId = 0, seq = nackSeq_++,
+    //            timestampMs = static_cast<uint32_t>(nowMs)}, **没有载荷**
+    //   5. encodePacketHeader 到 nackBuf_ -> socket_.sendTo(peer_, buf, PACKET_HEADER_SIZE)
+    //      成功 -> lastPliMs_ = nowMs; ++pliSent_; return true
+    //      失败 -> ++nackSendErrors_; return false  (**不要**更新 lastPliMs_,
+    //              没发出去的不该占用限流配额)
+    (void)nowMs;
+    return false;
+}
+
 void ReceiverPipeline::requestRetransmissions(const uint8_t* packet, size_t len) {
     if (config_.nack.windowPackets == 0) return;
 
@@ -582,7 +608,19 @@ void ReceiverPipeline::requestRetransmissions(const uint8_t* packet, size_t len)
         return;
     }
 
-    nackTracker_.onPacket(header.seq, dataHeader.fragCount);
+    nackTracker_.onPacket(header.seq, dataHeader.fragCount,
+                          (dataHeader.flags & DataHeader::FLAG_KEYFRAME) != 0);
+
+    // TODO(M4.4) 触发源 D: keyFramesGivenUp 是**累计值**, 要按增量做边沿触发 ——
+    //   直接判"非 0 就发"会每收一个包发一次 PLI。
+    //     const uint64_t given = nackTracker_.stats().keyFramesGivenUp;
+    //     if (given > seenKeyFramesGivenUp_) {
+    //         seenKeyFramesGivenUp_ = given;
+    //         requestKeyFrame(steadyNowMs());   // 限流在里面, 这里不用再判
+    //     }
+    //   注意要放在 collectNackTargets 之后 —— "请求次数用完"那条 givenUp 路径
+    //   是在 collect 里加的, 放前面会晚一轮才看到。
+
     nackTracker_.collectNackTargets(nackTargets_);
     if (nackTargets_.empty() || peer_.port == 0) return;
 
