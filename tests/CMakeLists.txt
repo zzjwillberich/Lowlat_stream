@@ -35,6 +35,7 @@ add_unit_test(test_udp_socket lltransport)     # UDP 收发(回环)
 add_unit_test(test_packetizer lltransport)     # 帧分片打包
 add_unit_test(test_frame_assembler lltransport)  # 接收端组包与丢包统计
 add_unit_test(test_jitter_buffer lltransport)    # M3.1 排序 + 按时放行 + 起播门
+add_unit_test(test_delay_estimator lltransport)  # M4.3 滑动窗口分位数 + 非对称跟随
 add_unit_test(test_loss_injector lltransport)    # M4.0 可复现的丢包注入
 add_unit_test(test_nack_tracker lltransport)     # M4.1 缺口判定与重传请求限流
 add_unit_test(test_nack_packet lltransport)      # M4.1 NACK 位图包的编解码

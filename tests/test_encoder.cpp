@@ -219,3 +219,106 @@ TEST(Encoder, LongRunStaysStable) {
     std::vector<EncodedFrame> tail;
     EXPECT_TRUE(enc.flush(tail).isOk());
 }
+
+
+// ========== M4.4 关键帧请求 ==========
+
+/**
+ * requestKeyFrame() 之后的**下一帧**必须是关键帧, 哪怕 GOP 还远没到。
+ *
+ * 这是 PLI 这条链路的终点: 接收端花屏 -> PLI -> 发送端 -> 这里。
+ * 链路上任何一环断了, 现象都是"画面一直花着直到下一个 GOP", 而 GOP 默认
+ * 就是 fps —— 一秒。慢得能看见, 但看不出是哪一环断的。
+ */
+TEST(Encoder, RequestKeyFrameForcesTheVeryNextFrame) {
+    Encoder enc;
+    NullSource src;
+    ASSERT_TRUE(enc.open(encCfg(/*gop=*/1000)).isOk());  // GOP 大到不会自己来 IDR
+    ASSERT_TRUE(src.open(srcCfg()).isOk());
+
+    RawFrame f;
+    std::vector<EncodedFrame> got;
+    for (int i = 0; i < 5; ++i) {
+        ASSERT_TRUE(src.readFrame(f).isOk());
+        got.clear();
+        ASSERT_TRUE(enc.encode(f, got).isOk());
+    }
+
+    enc.requestKeyFrame();
+    ASSERT_TRUE(src.readFrame(f).isOk());
+    got.clear();
+    ASSERT_TRUE(enc.encode(f, got).isOk());
+
+    ASSERT_FALSE(got.empty()) << "零延迟配置下一帧进一帧出";
+    EXPECT_TRUE(got.front().isKey) << "PLI 到了却还是 P 帧, 整条链路白搭";
+}
+
+/**
+ * 一次请求只买一个关键帧。
+ *
+ * 这条钉的是 pict_type 用完必须置回 AV_PICTURE_TYPE_NONE。frame_ 是复用的成员,
+ * 不置回的话**此后每一帧都是 IDR** —— 码率翻好几倍而画质没有变好,
+ * 而且只在**收到过一次 PLI 之后**才发作。不看码率根本注意不到。
+ */
+TEST(Encoder, RequestKeyFrameIsConsumedExactlyOnce) {
+    Encoder enc;
+    NullSource src;
+    ASSERT_TRUE(enc.open(encCfg(/*gop=*/1000)).isOk());
+    ASSERT_TRUE(src.open(srcCfg()).isOk());
+
+    enc.requestKeyFrame();
+
+    int keys = 0;
+    RawFrame f;
+    for (int i = 0; i < 20; ++i) {
+        ASSERT_TRUE(src.readFrame(f).isOk());
+        std::vector<EncodedFrame> got;
+        ASSERT_TRUE(enc.encode(f, got).isOk());
+        for (const auto& p : got) {
+            if (p.isKey) ++keys;
+        }
+    }
+    EXPECT_EQ(keys, 1) << "20 帧里出了 " << keys
+                       << " 个 IDR —— pict_type 没有置回 NONE, 码率会翻几倍";
+}
+
+/**
+ * 没有人请求时, 关键帧只按 GOP 来 —— 上一条的对照。
+ *
+ * 单独一条是因为上一条如果实现成"永远只发一个 IDR"也能过。
+ */
+TEST(Encoder, WithoutARequestKeyFramesStillFollowTheGop) {
+    Encoder enc;
+    NullSource src;
+    ASSERT_TRUE(enc.open(encCfg(/*gop=*/5)).isOk());
+    ASSERT_TRUE(src.open(srcCfg()).isOk());
+
+    const auto all = encodeFrames(enc, src, 20);
+    int keys = 0;
+    for (const auto& p : all) {
+        if (p.isKey) ++keys;
+    }
+    EXPECT_GE(keys, 3) << "gop=5 跑 20 帧, IDR 不该只有一两个";
+}
+
+/**
+ * requestKeyFrame() 在 open() 之前调不许崩, 也不许把请求丢掉。
+ *
+ * 它是**跨线程**调用的(发送线程收到 PLI -> 编码线程消费), 调用方无法保证
+ * 编码器一定已经 open。
+ */
+TEST(Encoder, RequestKeyFrameBeforeOpenIsHarmlessAndStillHonored) {
+    Encoder enc;
+    NullSource src;
+    enc.requestKeyFrame();
+
+    ASSERT_TRUE(enc.open(encCfg(/*gop=*/1000)).isOk());
+    ASSERT_TRUE(src.open(srcCfg()).isOk());
+
+    RawFrame f;
+    ASSERT_TRUE(src.readFrame(f).isOk());
+    std::vector<EncodedFrame> got;
+    ASSERT_TRUE(enc.encode(f, got).isOk());
+    ASSERT_FALSE(got.empty());
+    EXPECT_TRUE(got.front().isKey);
+}

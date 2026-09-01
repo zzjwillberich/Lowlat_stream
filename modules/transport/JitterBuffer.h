@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <map>
 
+#include "modules/transport/DelayEstimator.h"
 #include "modules/transport/FrameAssembler.h"
 
 /**
@@ -17,13 +18,17 @@
  */
 struct JitterBufferConfig {
     /**
-     * @brief 目标缓冲水位(毫秒)
+     * @brief 水位估计的整套配置; 命令行的 --jitter-ms 落在 delay.targetDelayMs 上
      *
      * @note **0 不等于"关掉这一层"**, 而是"水位为零"。水位就是能容忍多大的乱序和抖动:
      *          设成 0 之后, 任何比前一帧晚到的帧都会被判为过期丢弃, 一乱序就掉帧。
      *          它的用途是**测基线** —— 量出"不缓冲能做到多低", 好知道水位到底花了多少钱。
+     *
+     * @note M4.3 起水位可以自适应(delay.adaptive)。**本类不参与那个决策** ——
+     *          排序、容量、起播门在两种模式下逐字相同, 变的只有 computePlayAt
+     *          去问谁要答案。这就是把估计器单独拆出去的意义。
      */
-    int targetDelayMs = 50;
+    DelayEstimatorConfig delay;
 
     /**
      * @brief 缓冲里攒到几帧就开始提前放行
@@ -54,7 +59,8 @@ struct JitterBufferConfig {
 /**
  * 抖动缓冲的计数器。
  *
- * @note 丢帧的三种原因分开计: **太晚**说明网络抖动超过了水位(该调大 targetDelayMs),
+ * @note 丢帧的三种原因分开计: **太晚**说明网络抖动超过了水位(自适应模式下
+ *          说明水位没跟上, 见 DelayEstimatorConfig::windowMs 的响应时间推导),
  *          **溢出**说明消费端跟不上(该查解码耗时), **起播前丢弃**是正常的一次性代价。
  *          混成一个"丢帧数", 就分不清该调参数还是该查性能。
  */
@@ -167,6 +173,15 @@ public:
     const JitterBufferStats& stats() const { return stats_; }
 
     /**
+     * @brief 水位估计器的计数器
+     *
+     * @note 转发出去而不是把水位并进 JitterBufferStats: 两组数的**生命周期不同**。
+     *          JitterBufferStats 是累计量(丢了几帧), 水位是瞬时量(现在多少毫秒),
+     *          混在一起会诱使调用方把 currentDelayMs 也当成累计量去做差。
+     */
+    const DelayEstimatorStats& delayStats() const { return estimator_.stats(); }
+
+    /**
      * @brief 清空全部状态(含计数器和时钟映射), 回到刚构造的样子
      *
      * @note **仅用于重连** —— 对端换了、流从头开始, 所有历史都无效。
@@ -221,36 +236,16 @@ private:
      *
      * @return 本地时间轴上的应播时刻(毫秒)
      *
-     * @note 做法是在**发送端时间轴**和**本地时间轴**之间维护一个偏移量:
-     *          @code
-     *          offset      = nowMs - timestampMs        // 本帧观测到的偏移
-     *          minOffset_  = min(minOffset_, offset)    // 取历史最小 = 走得最快的那一趟
-     *          playAtMs    = timestampMs + minOffset_ + targetDelayMs
-     *          @endcode
-     *          早到的帧算出来的 playAt 更靠后, 于是多等; 晚到的帧少等甚至立刻到期 ——
-     *          抖动被吸收在水位里, 这才是 "jitter buffer" 这个名字的意思。
+     * @note M4.3 起这里只有一句 `return estimator_.observe(timestampMs, nowMs);` ——
+     *          "等多久"整个搬进了 DelayEstimator。**保留这个函数而不是让 push()
+     *          直接调估计器**, 是因为它同时是本类的一条契约: 一帧的 playAt
+     *          在 push 的那一刻算死一次, 之后不再重算。重算的话早到的帧会被
+     *          后来变化的水位改期, 交付节奏跟着水位一起抖。
      *
-     * @note **错误做法是 `playAt = 到达时刻 + targetDelayMs`**: 那只是给每一帧统一
-     *          加了个延迟, 抖动一点没被吸收, 早到的照样早播、晚到的照样晚播。
-     *
-     * @note 取**最小**偏移: 要估的是这条链路的**下限** C + T_min —— C 是两端时钟起点之差
-     *          (常数, 未知, 但对每一帧都相同), T 是本帧的传输耗时(每帧不同, 这就是抖动)。
-     *          offset = now - ts = C + T, 取历史最小即得到 C + T_min, 对应"网络最顺的那一趟"。
-     *
-     *          锚错基准有**两种相反**的失效模式, 别搞混:
-     *          - 基准**偏晚**(锚在慢样本上, 例如只用第一帧而它恰好走得慢): playAt 整体后移,
-     *            之后每帧多等 (T_slow - T_min) 毫秒, **实际水位比 targetDelayMs 大**,
-     *            现象是端到端延迟稳定地高于设定值。
-     *          - 基准**偏早**(锚在异常快的样本上): playAt 整体前移, 帧一到手就已经过期,
-     *            **水位形同虚设**, 现象是抖动完全没被吸收, 输出节奏跟着网络一起抖。
-     *
-     *          取 min 天然免疫第一种, 但对第二种毫无抵抗 —— 见下面那条已知限制。
-     *
-     * @note 偏移量只参与**差值**运算, 所以跨机器时钟起点不同也不影响排期(只是
-     *          算出来的绝对延迟数字没有意义, 见 Clock.h)。
-     *
-     * @note 已知限制: minOffset_ 只减不增, 网络永久变好之后水位不会自动收窄;
-     *          时钟频差也会让映射慢慢漂。两者都归 M4 的自适应水位处理。
+     * @note 原理和取舍(为什么是 `ts + offset基准 + 水位` 而不是 `到达时刻 + 水位`、
+     *          为什么基准取分位数而不是历史最小、锚错基准的两种相反失效模式)
+     *          全部搬到了 DelayEstimator.h, 不在这里重复一份 ——
+     *          两份注释迟早会互相矛盾, 而读代码的人不知道该信哪份。
      */
     uint64_t computePlayAt(uint32_t timestampMs, uint64_t nowMs);
 
@@ -280,9 +275,15 @@ private:
     uint64_t refExtended_ = 0;
     bool hasRef_ = false;
 
-    // ---- 时钟映射 ----
-    int64_t minOffsetMs_ = 0;
-    bool hasOffset_ = false;
+    /**
+     * @brief 时钟映射与水位; M4.3 起整块交给它
+     *
+     * @note 生命周期跟着**流**走, 不跟着帧走: reset() 要连它一起清(换了对端,
+     *          时钟差整个变了), 而 dropUntilKeyFrame() **绝不能**碰它 ——
+     *          流没变, 清掉窗口只会让水位在下游刚出过问题的时候重新冷启动。
+     *          同 NOTES D12 的推演。
+     */
+    DelayEstimator estimator_;
 
     // ---- 交付水位 ----
     uint64_t lastOutExtended_ = 0;

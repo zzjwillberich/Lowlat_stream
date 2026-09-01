@@ -44,7 +44,16 @@ namespace {
         pipeline.idleTimeoutMs = config.getInt("idle-timeout", 0);
         pipeline.recvTimeoutMs = config.getInt("recv-timeout", 200);
         pipeline.renderKind = config.get("render", "sdl");
-        pipeline.jitter.targetDelayMs = config.getInt("jitter-ms", 50);
+        // M4.3 自适应水位。--jitter-ms 的含义变了: 自适应关掉时它是**固定水位**
+        // (和 M3 逐字相同, 是 M4.5 的对照组); 打开时它是冷启动值与样本不足时的兜底。
+        pipeline.jitter.delay.targetDelayMs = config.getInt("jitter-ms", 50);
+        pipeline.jitter.delay.adaptive = config.getInt("jitter-adapt", 1) != 0;
+        pipeline.jitter.delay.windowMs =
+            static_cast<uint32_t>(std::max(0, config.getInt("jitter-window-ms", 10000)));
+        pipeline.jitter.delay.delayPercentile = config.getInt("jitter-pct", 95);
+        pipeline.jitter.delay.minDelayMs = config.getInt("jitter-min-ms", 10);
+        pipeline.jitter.delay.maxDelayMs = config.getInt("jitter-max-ms", 500);
+        pipeline.jitter.delay.downRateMsPerSec = config.getInt("jitter-down-rate", 10);
         pipeline.decoder.threads = config.getInt("threads", 1);
         pipeline.renderer.vsync = config.getInt("vsync", 0) != 0;
         pipeline.statsIntervalMs = config.getInt("stats-interval", 1000);
@@ -114,7 +123,8 @@ int main(int argc, char** argv) {
              "nack_sent=%llu nack_seqs=%llu nack_recovered=%llu nack_gaveup=%llu "
              "lost_exact=%llu nack_pending=%zu "
              "fec_recv=%llu fec_recovered=%llu fec_unrecoverable=%llu "
-             "pli_sent=%llu pli_suppressed=%llu decoded=%llu "
+             "pli_sent=%llu pli_suppressed=%llu "
+             "jitter_delay=%dms jitter_peak=%dms jitter_raw=%dms decoded=%llu "
              "rendered=%llu queue_peak=%zu/%zu elapsed=%llums",
              static_cast<unsigned long long>(stats.framesWritten),
              static_cast<unsigned long long>(stats.bytesWritten),
@@ -142,6 +152,8 @@ int main(int argc, char** argv) {
              static_cast<unsigned long long>(stats.fec.groupsUnrecoverable),
              static_cast<unsigned long long>(stats.pliSent),
              static_cast<unsigned long long>(stats.pliSuppressed),
+             stats.delay.currentDelayMs, stats.delay.peakDelayMs,
+             stats.delay.rawDelayMs,
              static_cast<unsigned long long>(stats.decoder.framesOut),
              static_cast<unsigned long long>(stats.renderer.framesRendered),
              stats.decodeQueuePeak, stats.renderQueuePeak,

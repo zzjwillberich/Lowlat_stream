@@ -152,7 +152,7 @@ Status ReceiverPipeline::validateConfig() const {
     }
     if (config_.maxFrames < 0 || config_.idleTimeoutMs < 0 || config_.maxPendingFrames == 0 ||
         config_.decodeQueueCapacity == 0 || config_.renderQueueCapacity == 0 ||
-        config_.statsIntervalMs < 0 || config_.jitter.targetDelayMs < 0 ||
+        config_.statsIntervalMs < 0 || config_.jitter.delay.targetDelayMs < 0 ||
         config_.jitter.maxFrames == 0 || config_.decoder.threads < 1) {
         return Status::error(Code::InvalidArg, "ReceiverPipeline: invalid pipeline configuration");
     }
@@ -329,9 +329,7 @@ void ReceiverPipeline::recvLoop(const std::atomic<bool>& stopRequested) {
                 ++decodeResyncs_;
                 queueA_.clear();
                 jitter_.dropUntilKeyFrame();
-                // TODO(M4.4) 触发源 B: 保险丝烧了 —— 画面已经冻结, 正在等下一个 IDR。
-                //   主动 requestKeyFrame(now) 能把冻结时间从"最长一个 GOP"缩短。
-                //   下面那处 dropUntilKeyFrame() 也要加, 两处是同一件事的两条路径。
+                requestKeyFrame(now);
                 break;
             }
         }
@@ -359,7 +357,7 @@ void ReceiverPipeline::recvLoop(const std::atomic<bool>& stopRequested) {
             ++decodeResyncs_;
             queueA_.clear();
             jitter_.dropUntilKeyFrame();
-            // TODO(M4.4) 触发源 B 的第二条路径; 同上面那处
+            requestKeyFrame(now);
         }
         // 正常 EOF 要把已入队数据和 Decoder 的内部缓存顺序排空；异常/用户停止仍走
         // requestStop()，立即关闭两条队列以唤醒所有阻塞点。
@@ -533,6 +531,7 @@ void ReceiverPipeline::publishRecvStats() {
     shared_.recvErrors = stats_.recvErrors;
     shared_.assembler = assembler_.stats();
     shared_.jitter = jitter_.stats();
+    shared_.delay = jitter_.delayStats();
     shared_.decodeQueuePeak = queueA_.peak();
     shared_.renderQueuePeak = queueB_.peak();
     shared_.decodeQueueDropped = queueA_.dropped() + decodeQueueRejected_.load();
@@ -575,21 +574,39 @@ void ReceiverPipeline::trackPeer(const uint8_t* packet, size_t len, const Endpoi
 }
 
 bool ReceiverPipeline::requestKeyFrame(uint64_t nowMs) {
-    // TODO(M4.4):
-    //   1. config_.pliMinIntervalMs <= 0 -> return false  (关掉 PLI, 零开销)
-    //   2. peer_.port == 0 -> return false                (还没见过对端)
-    //   3. 限流: lastPliMs_ != 0 且 nowMs - lastPliMs_ < pliMinIntervalMs
-    //      -> ++pliSuppressed_, return false
-    //      **注意 nowMs < lastPliMs_ 的情况**(不该发生, 但无符号减法会回绕成天文数字,
-    //      让限流永远不触发, 变成 PLI 风暴 —— 同 RetransmitCache::evictExpired 那条)
-    //   4. 组包: PacketHeader{type = Pli, streamId = 0, seq = nackSeq_++,
-    //            timestampMs = static_cast<uint32_t>(nowMs)}, **没有载荷**
-    //   5. encodePacketHeader 到 nackBuf_ -> socket_.sendTo(peer_, buf, PACKET_HEADER_SIZE)
-    //      成功 -> lastPliMs_ = nowMs; ++pliSent_; return true
-    //      失败 -> ++nackSendErrors_; return false  (**不要**更新 lastPliMs_,
-    //              没发出去的不该占用限流配额)
-    (void)nowMs;
-    return false;
+    if (config_.pliMinIntervalMs <= 0 || peer_.port == 0) return false;
+
+    if (lastPliMs_ != 0 &&
+        (nowMs < lastPliMs_ ||
+         nowMs - lastPliMs_ < static_cast<uint64_t>(config_.pliMinIntervalMs))) {
+        ++pliSuppressed_;
+        return false;
+    }
+
+    PacketHeader pliHeader;
+    pliHeader.type = PacketType::Pli;
+    pliHeader.streamId = 0;
+    pliHeader.seq = nackSeq_++;
+    pliHeader.timestampMs = static_cast<uint32_t>(nowMs);
+
+    if (nackBuf_.size() < PACKET_HEADER_SIZE) nackBuf_.resize(MAX_DATA_PACKET_SIZE);
+    const Status encodeStatus =
+        encodePacketHeader(pliHeader, nackBuf_.data(), nackBuf_.size());
+    if (!encodeStatus.isOk()) {
+        ++nackSendErrors_;
+        return false;
+    }
+
+    const Status sendStatus =
+        socket_.sendTo(peer_, nackBuf_.data(), PACKET_HEADER_SIZE);
+    if (!sendStatus.isOk()) {
+        ++nackSendErrors_;
+        return false;
+    }
+
+    lastPliMs_ = nowMs;
+    ++pliSent_;
+    return true;
 }
 
 void ReceiverPipeline::requestRetransmissions(const uint8_t* packet, size_t len) {
@@ -611,17 +628,14 @@ void ReceiverPipeline::requestRetransmissions(const uint8_t* packet, size_t len)
     nackTracker_.onPacket(header.seq, dataHeader.fragCount,
                           (dataHeader.flags & DataHeader::FLAG_KEYFRAME) != 0);
 
-    // TODO(M4.4) 触发源 D: keyFramesGivenUp 是**累计值**, 要按增量做边沿触发 ——
-    //   直接判"非 0 就发"会每收一个包发一次 PLI。
-    //     const uint64_t given = nackTracker_.stats().keyFramesGivenUp;
-    //     if (given > seenKeyFramesGivenUp_) {
-    //         seenKeyFramesGivenUp_ = given;
-    //         requestKeyFrame(steadyNowMs());   // 限流在里面, 这里不用再判
-    //     }
-    //   注意要放在 collectNackTargets 之后 —— "请求次数用完"那条 givenUp 路径
-    //   是在 collect 里加的, 放前面会晚一轮才看到。
-
     nackTracker_.collectNackTargets(nackTargets_);
+
+    const uint64_t given = nackTracker_.stats().keyFramesGivenUp;
+    if (given > seenKeyFramesGivenUp_) {
+        seenKeyFramesGivenUp_ = given;
+        requestKeyFrame(steadyNowMs());
+    }
+
     if (nackTargets_.empty() || peer_.port == 0) return;
 
     // 一个包放不下时只发最老的前缀。按编码器的贪心分条规则

@@ -32,7 +32,7 @@ namespace {
     JitterBufferConfig noKeyGate(int targetDelayMs = 0) {
         JitterBufferConfig cfg;
         cfg.startOnKeyFrame = false;
-        cfg.targetDelayMs = targetDelayMs;
+        cfg.delay.targetDelayMs = targetDelayMs;
         return cfg;
     }
 

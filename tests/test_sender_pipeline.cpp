@@ -21,6 +21,8 @@
 #include "app/sender/SenderPipeline.h"
 #include "common/Clock.h"
 #include "modules/capture/NullSource.h"
+#include "modules/transport/Packet.h"
+#include "modules/transport/UdpSocket.h"
 
 using namespace std::chrono_literals;
 
@@ -196,4 +198,186 @@ TEST(SenderPipeline, OpensEncoderWithSourceNegotiatedGeometry) {
         << "source open 后应使用 actualConfig() 覆盖 encoder 的宽高和帧率";
     EXPECT_EQ(pipeline.stats().capturedFrames, static_cast<uint64_t>(FRAMES));
     EXPECT_EQ(pipeline.stats().encodedFrames, static_cast<uint64_t>(FRAMES));
+}
+
+
+// ========== M4.4 反向通道按类型分流 ==========
+
+namespace {
+    /**
+     * 一个假接收端: 绑一个口, 收 sender 发来的数据包, 并能往回发裸包。
+     *
+     * 用真 socket 而不是直接调 drainReverseChannel(), 是因为要测的恰恰是
+     * **"从线上来的字节"** 这条路径 —— 类型分流、长度校验都只在那里发生。
+     */
+    class FakePeer {
+    public:
+        Status open() {
+            Status st = sock_.open();
+            if (!st.isOk()) return st;
+            return sock_.bind(Endpoint{"127.0.0.1", 0});
+        }
+
+        uint16_t port() const { return sock_.localEndpoint().port; }
+
+        /** @brief 收一个包; 返回 false 表示超时 */
+        bool recv(std::vector<uint8_t>& out, int timeoutMs) {
+            out.resize(MAX_PACKET_SIZE);
+            size_t len = 0;
+            const Status st = sock_.recvFrom(out.data(), out.size(), len, from_, timeoutMs);
+            if (!st.isOk()) return false;
+            out.resize(len);
+            seenPeer_ = true;
+            return true;
+        }
+
+        bool sendRaw(const uint8_t* data, size_t len) {
+            return seenPeer_ && sock_.sendTo(from_, data, len).isOk();
+        }
+
+    private:
+        UdpSocket sock_;
+        Endpoint from_;
+        bool seenPeer_ = false;
+    };
+
+    /** @brief 组一个只有通用头、没有载荷的包 */
+    std::vector<uint8_t> makeHeaderOnly(PacketType type) {
+        std::vector<uint8_t> buf(PACKET_HEADER_SIZE);
+        PacketHeader h;
+        h.type = type;
+        h.streamId = 0;
+        h.seq = 1;
+        h.timestampMs = 0;
+        EXPECT_TRUE(encodePacketHeader(h, buf.data(), buf.size()).isOk());
+        return buf;
+    }
+
+    /** @brief 这个包是不是一个关键帧分片 */
+    bool isKeyFragment(const std::vector<uint8_t>& pkt) {
+        PacketHeader h;
+        if (!decodePacketHeader(pkt.data(), pkt.size(), h).isOk()) return false;
+        if (h.type != PacketType::Data) return false;
+        DataHeader d;
+        if (!decodeDataHeader(pkt.data() + PACKET_HEADER_SIZE,
+                              pkt.size() - PACKET_HEADER_SIZE, d).isOk()) {
+            return false;
+        }
+        return (d.flags & DataHeader::FLAG_KEYFRAME) != 0;
+    }
+}  // namespace
+
+/**
+ * 一个只有通用头的 Pli 包必须走到 encoder_.requestKeyFrame(), 并计入 plisReceived。
+ *
+ * 这条钉的是 drainReverseChannel 的**类型分流**。少了这一支的现象是
+ * "PLI 发出去了、对端也收到了, 但画面还是花着" —— 而接收端的 pli_sent 是正常的,
+ * 排查时很容易一直盯着接收端。
+ */
+TEST(SenderPipeline, APliOnTheReverseChannelForcesAKeyFrame) {
+    FakePeer peer;
+    ASSERT_TRUE(peer.open().isOk());
+
+    SenderPipelineConfig cfg = pipelineConfig(/*frames=*/400, /*fps=*/1000);
+    cfg.encoder.gop = 100000;  // 大到跑完都不会自己来第二个 IDR
+    cfg.target = Endpoint{"127.0.0.1", peer.port()};
+
+    SenderPipeline pipeline(std::make_unique<NullSource>(), cfg);
+    std::atomic<bool> stop{false};
+    auto done = std::async(std::launch::async, [&] { return pipeline.run(stop); });
+
+    // 先把第一个(自然的)IDR 整个收完, 再发 PLI
+    std::vector<uint8_t> pkt;
+    int nonKeyRun = 0;
+    while (nonKeyRun < 20 && peer.recv(pkt, 2000)) {
+        nonKeyRun = isKeyFragment(pkt) ? 0 : nonKeyRun + 1;
+    }
+    ASSERT_EQ(nonKeyRun, 20) << "没等到稳定的 P 帧段, 后面的断言就不成立";
+
+    const std::vector<uint8_t> pli = makeHeaderOnly(PacketType::Pli);
+    ASSERT_TRUE(peer.sendRaw(pli.data(), pli.size()));
+
+    bool sawKeyAfterPli = false;
+    for (int i = 0; i < 400 && peer.recv(pkt, 2000); ++i) {
+        if (isKeyFragment(pkt)) {
+            sawKeyAfterPli = true;
+            break;
+        }
+    }
+
+    stop.store(true);
+    done.wait();
+
+    EXPECT_TRUE(sawKeyAfterPli) << "收到 PLI 之后没有出现新的 IDR";
+    EXPECT_EQ(pipeline.stats().plisReceived, 1u);
+    EXPECT_EQ(pipeline.stats().reverseMalformed, 0u);
+}
+
+/**
+ * 带载荷的 Pli 是畸形包: 不许触发 IDR, 要计入 reverseMalformed。
+ *
+ * PLI 没有载荷, 多出来的字节只可能是别人在往这个端口上发东西, 或者上一轮的残留。
+ * 不查的话它会安静地当成合法 PLI 触发一个 IDR —— 而 IDR 大约是 P 帧的
+ * 二十几倍大小, 一个乱发包的进程就能把码率顶穿。
+ */
+TEST(SenderPipeline, APliWithATrailingPayloadIsRejected) {
+    FakePeer peer;
+    ASSERT_TRUE(peer.open().isOk());
+
+    SenderPipelineConfig cfg = pipelineConfig(/*frames=*/200, /*fps=*/1000);
+    cfg.encoder.gop = 100000;
+    cfg.target = Endpoint{"127.0.0.1", peer.port()};
+
+    SenderPipeline pipeline(std::make_unique<NullSource>(), cfg);
+    std::atomic<bool> stop{false};
+    auto done = std::async(std::launch::async, [&] { return pipeline.run(stop); });
+
+    std::vector<uint8_t> pkt;
+    ASSERT_TRUE(peer.recv(pkt, 2000));
+
+    std::vector<uint8_t> bad = makeHeaderOnly(PacketType::Pli);
+    bad.push_back(0xAB);  // 一个字节的赘肉就够
+    ASSERT_TRUE(peer.sendRaw(bad.data(), bad.size()));
+
+    for (int i = 0; i < 100 && peer.recv(pkt, 1000); ++i) {
+    }
+
+    stop.store(true);
+    done.wait();
+
+    EXPECT_EQ(pipeline.stats().plisReceived, 0u);
+    EXPECT_GE(pipeline.stats().reverseMalformed, 1u);
+}
+
+/**
+ * 反向通道上来一个既不是 Nack 也不是 Pli 的包 —— 计 malformed, 不许崩。
+ *
+ * 监听的是发送端自己的端口, 谁都能往上面发东西。
+ */
+TEST(SenderPipeline, AnUnknownReversePacketTypeIsCountedNotObeyed) {
+    FakePeer peer;
+    ASSERT_TRUE(peer.open().isOk());
+
+    SenderPipelineConfig cfg = pipelineConfig(/*frames=*/200, /*fps=*/1000);
+    cfg.encoder.gop = 100000;
+    cfg.target = Endpoint{"127.0.0.1", peer.port()};
+
+    SenderPipeline pipeline(std::make_unique<NullSource>(), cfg);
+    std::atomic<bool> stop{false};
+    auto done = std::async(std::launch::async, [&] { return pipeline.run(stop); });
+
+    std::vector<uint8_t> pkt;
+    ASSERT_TRUE(peer.recv(pkt, 2000));
+
+    const std::vector<uint8_t> data = makeHeaderOnly(PacketType::Data);
+    ASSERT_TRUE(peer.sendRaw(data.data(), data.size()));
+
+    for (int i = 0; i < 100 && peer.recv(pkt, 1000); ++i) {
+    }
+
+    stop.store(true);
+    done.wait();
+
+    EXPECT_EQ(pipeline.stats().plisReceived, 0u);
+    EXPECT_GE(pipeline.stats().reverseMalformed, 1u);
 }

@@ -412,3 +412,150 @@ TEST(ReceiverPipeline, GarbagePacketsDoNotBecomeThePeer) {
     EXPECT_GT(pipeline.stats().assembler.packetsMalformed, 0u) << "垃圾包压根没送到";
     EXPECT_EQ(pipeline.peer().port, 0u) << "垃圾包把反向通道的目的地设走了";
 }
+
+
+// ---------- M4.4 PLI 触发源 D: NACK 放弃了关键帧分片 ----------
+
+namespace {
+    /**
+     * 用**同一个** Packetizer 连发多帧, 于是 seq 全程连续。
+     *
+     * 上面那个 sendFrame 每帧新建一个 Packetizer 且起始 seq = frameId*100,
+     * 帧与帧之间会空出几十个 seq —— 对 NackTracker 来说那是几十个真缺口,
+     * 一帧就够把缺口表撑爆。测 PLI 触发必须先把这个噪声去掉。
+     */
+    class SeqStream {
+    public:
+        SeqStream() : packer_(0, 1000) {
+            EXPECT_TRUE(sock_.open().isOk());
+        }
+
+        /** @param skipIndex 不发的分片下标; SIZE_MAX 表示全发 */
+        void send(uint16_t port, const std::vector<uint8_t>& data, uint32_t frameId,
+                  bool isKey, size_t skipIndex = SIZE_MAX) {
+            std::vector<PacketBuffer> packets;
+            EncodedFrameView view;
+            view.data = data.data();
+            view.len = data.size();
+            view.frameId = frameId;
+            view.captureMs = 4242;
+            view.isKey = isKey;
+            ASSERT_TRUE(packer_.packetize(view, packets).isOk());
+
+            const Endpoint to{"127.0.0.1", port};
+            for (size_t i = 0; i < packets.size(); ++i) {
+                if (i == skipIndex) continue;
+                ASSERT_TRUE(sock_.sendTo(to, packets[i].data(), packets[i].size()).isOk());
+            }
+        }
+
+    private:
+        Packetizer packer_;
+        UdpSocket sock_;
+    };
+
+    ReceiverPipelineConfig pliConfig() {
+        ReceiverPipelineConfig cfg = receiverConfig();
+        cfg.idleTimeoutMs = 600;
+        cfg.nack.windowPackets = 1024;
+        cfg.nack.maxRequestsPerSeq = 1;  // 请求一次就放弃, 让 givenUp 快点发生
+        cfg.fec.recentPackets = 0;       // 别让 FEC 把洞补上, 这里要的就是补不上
+        cfg.pliMinIntervalMs = 1000;
+        return cfg;
+    }
+}  // namespace
+
+/**
+ * NACK 对一个关键帧分片放弃之后, 必须发且**只发一次** PLI。
+ *
+ * keyFramesGivenUp 是**累计值**。直接判"非 0 就发"的话, 之后每收到一个包
+ * 都会再走一次 requestKeyFrame —— 发不出去(被限流挡住), 但 pliSuppressed
+ * 会随着包数线性涨。所以这条的判据不是 pliSent, 而是 **pliSuppressed**:
+ * 它是电平触发和边沿触发唯一看得出区别的地方。
+ */
+TEST(ReceiverPipeline, GivingUpAKeyFrameFragmentSendsExactlyOnePli) {
+    ReceiverPipeline pipeline(pliConfig());
+    ASSERT_TRUE(pipeline.open().isOk());
+    const uint16_t port = pipeline.boundPort();
+
+    std::atomic<bool> stop{false};
+    auto done = std::async(std::launch::async, [&] { return pipeline.run(stop); });
+
+    const std::vector<uint8_t> payload = fakeStream(8000);  // 约 7 个分片
+    SeqStream stream;
+
+    stream.send(port, payload, 0, /*isKey=*/true);                    // 建立基线与对端
+    stream.send(port, payload, 1, /*isKey=*/true, /*skipIndex=*/2);   // 关键帧缺一片
+    for (uint32_t f = 2; f < 12; ++f) {                               // 推进 seq, 逼 NACK 放弃
+        stream.send(port, payload, f, /*isKey=*/false);
+        std::this_thread::sleep_for(5ms);
+    }
+
+    done.wait();
+    const ReceiverPipelineStats& s = pipeline.stats();
+
+    EXPECT_GE(s.nack.keyFramesGivenUp, 1u) << "构造没生效: 根本没放弃过关键帧分片";
+    EXPECT_EQ(s.pliSent, 1u);
+    EXPECT_LE(s.pliSuppressed, 1u)
+        << "pliSuppressed=" << s.pliSuppressed
+        << " —— 电平触发了: 放弃之后每收一个包都在重新请求关键帧";
+}
+
+/**
+ * 上一条的对照: 一个洞都没有时**一个 PLI 都不许发**。
+ *
+ * 没有这条的话, 一个"无条件每帧发 PLI"的实现也能过上一条 —— 限流会把
+ * pliSent 压到 1, pliSuppressed 也可能恰好很小。
+ */
+TEST(ReceiverPipeline, ACleanStreamNeverAsksForAKeyFrame) {
+    ReceiverPipeline pipeline(pliConfig());
+    ASSERT_TRUE(pipeline.open().isOk());
+    const uint16_t port = pipeline.boundPort();
+
+    std::atomic<bool> stop{false};
+    auto done = std::async(std::launch::async, [&] { return pipeline.run(stop); });
+
+    const std::vector<uint8_t> payload = fakeStream(8000);
+    SeqStream stream;
+    for (uint32_t f = 0; f < 12; ++f) {
+        stream.send(port, payload, f, /*isKey=*/f == 0);
+        std::this_thread::sleep_for(5ms);
+    }
+
+    done.wait();
+    EXPECT_EQ(pipeline.stats().pliSent, 0u);
+    EXPECT_EQ(pipeline.stats().pliSuppressed, 0u);
+    EXPECT_EQ(pipeline.stats().nack.keyFramesGivenUp, 0u);
+}
+
+/**
+ * 丢的是 P 帧分片时不该发 PLI —— NACK 兜得住的事情不要惊动 IDR。
+ *
+ * 一个 IDR 大约是 P 帧的二十几倍大小。丢一片 P 帧就要一个 IDR 的话,
+ * 弱网下会正反馈: 丢包 -> IDR -> IDR 更大更容易丢 -> 再来一个 IDR。
+ */
+TEST(ReceiverPipeline, LosingANonKeyFragmentDoesNotEscalateToPli) {
+    ReceiverPipeline pipeline(pliConfig());
+    ASSERT_TRUE(pipeline.open().isOk());
+    const uint16_t port = pipeline.boundPort();
+
+    std::atomic<bool> stop{false};
+    auto done = std::async(std::launch::async, [&] { return pipeline.run(stop); });
+
+    const std::vector<uint8_t> payload = fakeStream(8000);
+    SeqStream stream;
+
+    stream.send(port, payload, 0, /*isKey=*/true);
+    stream.send(port, payload, 1, /*isKey=*/false, /*skipIndex=*/2);
+    for (uint32_t f = 2; f < 12; ++f) {
+        stream.send(port, payload, f, /*isKey=*/false);
+        std::this_thread::sleep_for(5ms);
+    }
+
+    done.wait();
+    const ReceiverPipelineStats& s = pipeline.stats();
+
+    EXPECT_GE(s.nack.givenUp, 1u) << "构造没生效: 这个洞根本没被放弃";
+    EXPECT_EQ(s.nack.keyFramesGivenUp, 0u) << "丢的是 P 帧分片, 不该记成关键帧";
+    EXPECT_EQ(s.pliSent, 0u);
+}

@@ -72,7 +72,7 @@ struct ReceiverPipelineConfig {
      */
     std::string renderKind = "sdl";
 
-    /** @brief jitter buffer 的整套配置; 命令行的 --jitter-ms 落在 targetDelayMs 上 */
+    /** @brief jitter buffer 的整套配置; 命令行的 --jitter-ms 落在 delay.targetDelayMs 上 */
     JitterBufferConfig jitter;
 
     /** @brief 解码器配置 */
@@ -199,6 +199,15 @@ struct ReceiverPipelineStats {
 
     /** @brief jitter buffer 的计数器快照 */
     JitterBufferStats jitter;
+
+    /**
+     * @brief 水位估计器的瞬时状态 (M4.3)
+     *
+     * @note 这一组和它上面所有计数器**性质不同**: 上面的是累计量, 做差有意义;
+     *          这里的 currentDelayMs / rawDelayMs / floorOffsetMs 是**瞬时量**,
+     *          做差没有意义。周期统计里它们要按"当前值"打印, 不是按增量。
+     */
+    DelayEstimatorStats delay;
 
     /** @brief 解码器的计数器快照; framesMissingMeta 稳态下应当恒为 0 */
     DecoderStats decoder;

@@ -157,11 +157,9 @@ Status Encoder::encode(const RawFrame& in, std::vector<EncodedFrame>& out) {
     pending_[nextPts_] = Pending{in.captureMs, in.frameId};
     ++nextPts_;
 
-    // TODO(M4.4): 消费 keyFrameRequested_(exchange(false)), 为真时置
-    //   frame_->pict_type = AV_PICTURE_TYPE_I; 否则必须置回 AV_PICTURE_TYPE_NONE。
-    //   **置回是必须的**: frame_ 是复用的成员, 上一帧留下的 I 会让**每一帧**都成 IDR ——
-    //   现象是码率暴涨好几倍而画质没变好, 而且只在收到过一次 PLI 之后才出现。
-    //   用 exchange 而不是 load+store: 两条线程同时来时 load+store 会丢掉一次请求。
+    frame_->pict_type = keyFrameRequested_.exchange(false)
+                            ? AV_PICTURE_TYPE_I
+                            : AV_PICTURE_TYPE_NONE;
 
     rc = avcodec_send_frame(ctx_, frame_);
     if (rc < 0) {
@@ -244,7 +242,5 @@ Status Encoder::drainPackets(std::vector<EncodedFrame>& out) {
 }
 
 void Encoder::requestKeyFrame() {
-    // TODO(M4.4): keyFrameRequested_.store(true)。就这一行 ——
-    //   复杂度全在消费侧(encode() 里的 exchange + 用完置回 pict_type)。
-    //   不要在这里碰 ctx_ 或 frame_: 那两个归编码线程, 这个函数在发送线程上被调。
+    keyFrameRequested_.store(true);
 }

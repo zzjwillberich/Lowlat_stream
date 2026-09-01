@@ -192,7 +192,7 @@ TEST(ReceiverE2E, MaxFramesDrainsTheJitterBufferTail) {
 
     ReceiverPipelineConfig cfg = receiverConfig();
     cfg.maxFrames = FRAMES;
-    cfg.jitter.targetDelayMs = 133;  // ≈4 帧 @30fps
+    cfg.jitter.delay.targetDelayMs = 133;  // ≈4 帧 @30fps
     ReceiverPipeline receiver(cfg);
     ASSERT_TRUE(receiver.open().isOk());
 

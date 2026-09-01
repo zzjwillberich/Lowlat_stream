@@ -31,6 +31,9 @@ namespace {
             || key == "send-cap" || key == "recv-timeout" || key == "idle-timeout"
             // M3 接收端解码渲染参数
             || key == "render" || key == "jitter-ms" || key == "vsync"
+            || key == "jitter-adapt" || key == "jitter-window-ms"
+            || key == "jitter-pct" || key == "jitter-min-ms"
+            || key == "jitter-max-ms" || key == "jitter-down-rate"
             || key == "threads" || key == "stats-interval"
             // M4 弱网对抗参数
             || key == "loss" || key == "seed"
@@ -237,5 +240,13 @@ void Config::printUsage() const {
         "                        0 disables FEC decoding (default: 64)\n"
         "  --pli-ms <ms>         Receiver min interval between key-frame requests;\n"
         "                        0 disables PLI (default: 1000)\n"
+        "Adaptive jitter buffer (M4.3, receiver):\n"
+        "  --jitter-adapt <0|1>  Adapt the water level to measured jitter (default: 1)\n"
+        "                        0 pins it at --jitter-ms; that is the M3 baseline.\n"
+        "  --jitter-window-ms <n> Sliding window for the estimate (default: 10000)\n"
+        "  --jitter-pct <n>      Percentile the level tracks, 0-100 (default: 95)\n"
+        "  --jitter-min-ms <n>   Lower bound on the level (default: 10)\n"
+        "  --jitter-max-ms <n>   Upper bound on the level (default: 500)\n"
+        "  --jitter-down-rate <n> Max shrink rate in ms/s; growth is instant (default: 10)\n"
     );
 }

@@ -14,13 +14,6 @@
 NackTracker::NackTracker(NackTrackerConfig config) : config_(std::move(config)) {}
 
 void NackTracker::onPacket(uint32_t seq, uint16_t fragCount, bool isKey) {
-    // TODO(M4.4): 登记缺口时把 isKey 记进 GapState::likelyKeyFrame ——
-    //   "揭示这个缺口的那个包"就是当前这个包(它的 seq 比缺口新)。
-    //   放弃缺口时(givenUp 那两处: 滑出窗口 和 请求次数用完),
-    //   likelyKeyFrame 为真就 ++stats_.keyFramesGivenUp。
-    //   两处都要加, 漏一处的现象是"丢包一多 PLI 就不发了"——
-    //   因为丢得越多越容易走"滑出窗口"那条路。
-    (void)isKey;
     // 按以下顺序更新:
     //   1. ++stats_.packetsSeen
     //   2. 更新乱序容忍 = clamp(fragCount, minReorderPackets, maxReorderPackets)
@@ -81,6 +74,7 @@ void NackTracker::onPacket(uint32_t seq, uint16_t fragCount, bool isKey) {
             static_cast<uint64_t>(age) >= config_.windowPackets) {
             ++stats_.givenUp;
             ++stats_.lostForReal;
+            if (gap->second.likelyKeyFrame) ++stats_.keyFramesGivenUp;
             gap = gaps_.erase(gap);
         } else {
             ++gap;
@@ -96,7 +90,8 @@ void NackTracker::onPacket(uint32_t seq, uint16_t fragCount, bool isKey) {
     stats_.lostForReal += immediatelyGivenUp;
 
     for (uint64_t age = trackedCount; age != 0; --age) {
-        gaps_.emplace(highestSeq_ - static_cast<uint32_t>(age), GapState{});
+        gaps_.emplace(highestSeq_ - static_cast<uint32_t>(age),
+                      GapState{0, 0, isKey});
     }
     stats_.pending = gaps_.size();
 }
@@ -130,6 +125,7 @@ void NackTracker::collectNackTargets(std::vector<uint32_t>& out) {
         if (gap.requestCount >= config_.maxRequestsPerSeq) {
             ++stats_.givenUp;
             ++stats_.lostForReal;
+            if (gap.likelyKeyFrame) ++stats_.keyFramesGivenUp;
             gaps_.erase(found);
             continue;
         }
@@ -149,6 +145,7 @@ void NackTracker::collectNackTargets(std::vector<uint32_t>& out) {
         if (gap.requestCount >= config_.maxRequestsPerSeq) {
             ++stats_.givenUp;
             ++stats_.lostForReal;
+            if (gap.likelyKeyFrame) ++stats_.keyFramesGivenUp;
             gaps_.erase(found);
         }
     }

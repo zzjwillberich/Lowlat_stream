@@ -11,7 +11,8 @@
 #include <limits>
 #include <utility>
 
-JitterBuffer::JitterBuffer(JitterBufferConfig config) : config_(std::move(config)) {
+JitterBuffer::JitterBuffer(JitterBufferConfig config)
+    : config_(std::move(config)), estimator_(config_.delay) {
     if (config_.hardLimitFrames == 0) {
         const size_t minLimit = 1;
         if (config_.maxFrames > std::numeric_limits<size_t>::max() / 2) {
@@ -91,8 +92,7 @@ void JitterBuffer::reset() {
     refExtended_ = 0;
     hasRef_ = false;
 
-    minOffsetMs_ = 0;
-    hasOffset_ = false;
+    estimator_.reset();
 
     lastOutExtended_ = 0;
     hasOutput_ = false;
@@ -104,7 +104,8 @@ void JitterBuffer::reset() {
 void JitterBuffer::dropUntilKeyFrame() {
     // 这是下游跟不上时的局部重启，不是重连：帧号扩展锚、时钟映射和已交付水位都
     // 必须保留。清掉它们会让回绕后的新帧永久被判作过期，也会把抖动水位重新锚在
-    // 拥塞期间的慢样本上。
+    // 拥塞期间的慢样本上。**estimator_ 同理，这里不碰它**——流没变，
+    // 而这一刻恰好是最需要准确水位的时候。
     stats_.framesDroppedForResync += pending_.size();
     pending_.clear();
     started_ = !config_.startOnKeyFrame;
@@ -128,17 +129,7 @@ uint64_t JitterBuffer::extendFrameId(uint32_t frameId) {
 }
 
 uint64_t JitterBuffer::computePlayAt(uint32_t timestampMs, uint64_t nowMs) {
-    // 全程 int64: 跨机器时两台机器的 steady_clock 起点毫不相干, offset 可能是
-    // 很大的负数, 用无符号算会直接绕成天文数字
-    const int64_t offset = static_cast<int64_t>(nowMs) - static_cast<int64_t>(timestampMs);
-    if (!hasOffset_ || offset < minOffsetMs_) {
-        minOffsetMs_ = offset;
-        hasOffset_ = true;
-    }
-
-    const int64_t playAt = static_cast<int64_t>(timestampMs) + minOffsetMs_ +
-                           static_cast<int64_t>(config_.targetDelayMs);
-    return playAt < 0 ? 0 : static_cast<uint64_t>(playAt);
+    return estimator_.observe(timestampMs, nowMs);
 }
 
 void JitterBuffer::enforceCapacity() {
