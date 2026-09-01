@@ -7,3 +7,6 @@ build/
 .vscode/
 .cache/
 .claude
+
+# M4.5 实验产物: 日志很大, 结论进 docs/ 而不是进仓库
+bench/

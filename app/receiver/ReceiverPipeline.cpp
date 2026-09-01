@@ -482,7 +482,7 @@ void ReceiverPipeline::renderLoop(const std::atomic<bool>& stopRequested) {
             const LatencySummary window = summarizeLatency(latencyWindow_);
             LOG_INFO("receiver",
                      "fps=%llu latency samples=%llu p50=%ums p95=%ums | queueA=%zu queueB=%zu "
-                     "dropped=%llu resyncs=%llu assembler_lost=%llu",
+                     "dropped=%llu resyncs=%llu assembler_lost=%llu jitter_delay=%dms",
                      static_cast<unsigned long long>(fps),
                      static_cast<unsigned long long>(window.samples), window.p50Ms, window.p95Ms,
                      queueA_.size(), queueB_.size(),
@@ -492,7 +492,8 @@ void ReceiverPipeline::renderLoop(const std::atomic<bool>& stopRequested) {
                                                      snapshot.decodeQueueDropped +
                                                      snapshot.renderQueueDropped),
                      static_cast<unsigned long long>(snapshot.decodeResyncs),
-                     static_cast<unsigned long long>(snapshot.assembler.packetsLost()));
+                     static_cast<unsigned long long>(snapshot.assembler.packetsLost()),
+                     snapshot.delay.currentDelayMs);
             latencyWindow_.reset();
             lastStatsMs = now;
             lastRendered = renderedNow;
