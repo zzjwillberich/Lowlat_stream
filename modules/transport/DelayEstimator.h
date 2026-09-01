@@ -314,4 +314,7 @@ private:
     /** @brief 上一次 observe 的时刻, 用来算降速的 dt */
     uint64_t lastObserveMs_ = 0;
     bool hasLastObserve_ = false;
+
+    /** @brief 下调限速除以 1000 后留下的余数, 避免逐帧小 dt 永远截成 0 */
+    uint64_t downRateRemainder_ = 0;
 };

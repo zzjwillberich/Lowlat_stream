@@ -163,11 +163,17 @@ TEST(DelayEstimatorColdStart, HoldsTheInitialLevelUntilEnoughSamples) {
  * 上调是**立刻**的: 一到分位数够格, 水位当帧就跳上去, 不受降速限制。
  *
  * 上调慢 = 帧到手就过期 = 掉帧, 不可逆; 所以这个方向不设任何闸门。
+ *
+ * @note 初值特意设成 0 —— 否则这条用例会和降速契约打架: 初值 50、降速 10ms/s、
+ *          稳态段只跑了 0.99 秒, 水位最低只能降到 41, 而那正是
+ *          ShrinksNoFasterThanTheConfiguredRate 要求的行为。
+ *          这里要隔离的是**上调**那一支, 就不该让初值的衰减掺进来。
  */
 TEST(DelayEstimatorAsymmetry, RaisesImmediatelyWithNoRateLimit) {
     DelayEstimatorConfig cfg = adaptiveCfg();
     cfg.downRateMsPerSec = 10;
     cfg.windowMs = 1000000;
+    cfg.targetDelayMs = 0;
     DelayEstimator est(cfg);
 
     uint64_t send = 100000;
@@ -213,10 +219,14 @@ TEST(DelayEstimatorAsymmetry, ShrinksNoFasterThanTheConfiguredRate) {
 }
 
 /**
- * 降速用的 dt 是两次 observe 的**实际间隔**, 而且要先乘后除。
+ * 降速在**逐帧步进**下也必须真的降。
  *
- * 先除的话 30fps 的 dt=33ms 会算出 `10 * 33/1000 = 0`, 降速永远是 0 ——
- * 水位只涨不跌。而这个 bug 在 dt 很大的测试里**看不出来**。
+ * 30fps 的 dt = 33ms, 而 `10 * 33 / 1000 = 0` —— 整数除法把每一帧的降速
+ * 全抹成 0, 水位只涨不跌。先乘后除只是必要条件, **不充分**:
+ * 真正让它工作的是把余数攒起来(downRateRemainder_), 攒够 1000 才降 1ms。
+ *
+ * 这个 bug 在 dt 很大的用例里完全看不出来 —— 一次喂 1 秒的间隔就正好绕过它。
+ * 所以这条特意用一帧的步长, 而且要走够 300 步。
  */
 TEST(DelayEstimatorAsymmetry, IntegerRateMathSurvivesOneFrameSteps) {
     DelayEstimatorConfig cfg = adaptiveCfg();
@@ -232,7 +242,7 @@ TEST(DelayEstimatorAsymmetry, IntegerRateMathSurvivesOneFrameSteps) {
     feedSteady(est, 300, send, now, 33, 5);
 
     EXPECT_LT(est.stats().currentDelayMs, 1000)
-        << "逐帧步进也必须能降 —— 先除后乘会让降速恒为 0";
+        << "逐帧步进也必须能降 —— 不攒余数的话每帧都是 10*33/1000 = 0";
     EXPECT_GT(est.stats().currentDelayMs, 850)
         << "但也不能降过头: 9.9 秒 @10ms/s 只准缩约 99ms";
 }
@@ -287,21 +297,30 @@ TEST(DelayEstimatorWindow, EvictsByArrivalTimeAndCounts) {
  * 单调时钟理论上不回退, 但 nowMs 是**调用方传进来的** —— 传什么都合法。
  * 无符号减法一绕, 整个窗口会被一次清空, 水位无声地冷启动。
  * RetransmitCache::evictExpired 已经为同一条踩过一次。
+ *
+ * @note 回退量必须跨过**队头**才测得到: 淘汰是从最老的一端扫、遇到够年轻的就停,
+ *          所以只往回挪几毫秒的话, 队头还年轻, 循环第一轮就 break 了 ——
+ *          会绕的那个减法根本执行不到。第一版这条用例就是这么写的, 变异测试
+ *          (把 `atMs > nowMs` 那半个条件删掉)照样全绿。
  */
 TEST(DelayEstimatorWindow, ABackwardNowDoesNotWipeTheWindow) {
     DelayEstimatorConfig cfg = adaptiveCfg();
     cfg.windowMs = 100000;
     DelayEstimator est(cfg);
 
+    const uint64_t firstArrival = 100005;  // feedSteady 的第一个样本落在这儿
     uint64_t send = 100000;
     uint64_t now = 0;
     feedSteady(est, 50, send, now, 10, 5);
     const size_t before = est.stats().windowSize;
     ASSERT_EQ(before, 50u);
+    ASSERT_GT(now, firstArrival);
 
-    est.observe(static_cast<uint32_t>(send), now - 5);  // 时间倒着走一步
+    // 倒退到比队头还早 —— 不设防的话 nowMs - atMs 会绕成天文数字, 一轮清空整个窗口
+    est.observe(static_cast<uint32_t>(send), firstArrival - 1);
     EXPECT_GE(est.stats().windowSize, before)
         << "回退的 nowMs 不该触发一次全窗口淘汰";
+    EXPECT_EQ(est.stats().samplesEvicted, 0u);
 }
 
 // ---------------------------------------------------------------- 夹取
