@@ -1,0 +1,10 @@
+commit    24bd201 0 个未提交改动
+kernel    6.6.87.2-microsoft-standard-WSL2
+date      2026-09-01T22:59:14+08:00
+frames    1000 @ 30fps  640x480 2000kbps
+seeds     1 2 3
+groups    g4
+netem     生效设备 loopback0
+
+netem 的 delay 值是单向的; lo 上去程回程各计一次, RTT = 2x。
+render=null: 走真解码, 不开窗口。SDL 的显示延迟不在这些数里。
