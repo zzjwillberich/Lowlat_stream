@@ -76,26 +76,62 @@ done
 
 HAVE_NETEM=0
 SUDO_KEEPALIVE=""
-if { wants g3 || wants g4; } && [[ $DRY_RUN -eq 0 ]]; then
-    if ! command -v tc >/dev/null 2>&1; then
-        echo "!! 找不到 tc, g3/g4 跳过 (apt install iproute2)" >&2
-    else
-        echo "g3/g4 要给 lo 挂 netem, 现在申请一次 sudo (只在这里问一次):"
-        if sudo -v; then
-            # 探针用**真正要用的那条语法**(带抖动的 delay), 不是 `delay 1ms` ——
-            # 探针和实际命令不一样的话, 语法问题会在 20 分钟后才暴露。
-            if sudo -n tc qdisc replace dev lo root netem delay 10ms 5ms 2>/dev/null; then
-                sudo -n tc qdisc del dev lo root 2>/dev/null
-                HAVE_NETEM=1
+NETEM_DEV=""
 
-                # sudo 凭据默认 15 分钟过期, 而全量要跑一个钟头。
-                # 第一次跑就是这么废掉的: 探针在第 0 分钟通过, g3 在第 20 分钟开始,
-                # 那时 `sudo -n` 已经要密码了 —— 每一格都打印"设置失败"然后跳过,
-                # 脚本正常退出、返回 0。**最需要的两组就这样没了, 而且不报错。**
-                ( while sudo -n true 2>/dev/null; do sleep 60; done ) &
-                SUDO_KEEPALIVE=$!
-            else
-                echo "!! netem 挂不上 lo, g3/g4 跳过 (查 sch_netem 模块)" >&2
+# 量一次回环往返, 毫秒(浮点); 拿不到回 0。
+lo_rtt_ms() {
+    ping -c 3 -i 0.2 -W 1 127.0.0.1 2>/dev/null | tail -1 |
+        awk -F'[/ ]' '/=/ {for (i = 1; i <= NF; i++)
+                              if ($i ~ /^[0-9]+\.[0-9]+$/) { print $(i + 1); exit }}'
+}
+
+# 在 $1 这个设备上挂 10ms 延迟, **实测**回环是不是真的慢了, 然后撤掉。
+netem_probe_dev() {
+    sudo -n tc qdisc replace dev "$1" root netem delay 10ms >/dev/null 2>&1 || return 1
+    local rtt; rtt="$(lo_rtt_ms)"
+    sudo -n tc qdisc del dev "$1" root >/dev/null 2>&1
+    awk -v r="${rtt:-0}" 'BEGIN { exit !(r + 0 >= 10) }'
+}
+
+if { wants g3 || wants g4; } && [[ $DRY_RUN -eq 0 ]]; then
+    if ! command -v tc >/dev/null 2>&1 || ! command -v ping >/dev/null 2>&1; then
+        echo "!! 缺 tc 或 ping, g3/g4 跳过 (apt install iproute2 iputils-ping)" >&2
+    else
+        echo "g3/g4 要挂 netem, 现在申请一次 sudo (只在这里问一次):"
+        if sudo -v; then
+            # sudo 凭据默认 15 分钟过期而全量要跑一个钟头 —— 后台续期。
+            ( while sudo -n true 2>/dev/null; do sleep 60; done ) &
+            SUDO_KEEPALIVE=$!
+
+            # **回环走哪个设备是探出来的, 不是猜的。**
+            #
+            # 常规 Linux 上 127.0.0.1 走 lo; 但 WSL2 的 networkingMode=mirrored
+            # 另起了一个 loopback0, 回环流量走它而**不经过 lo 的 qdisc**。
+            # 第二轮就栽在这: netem 挂在 lo 上, tc 每次都返回 0, qdisc 也确实在,
+            # 但包一点没被延迟 —— g3 三档抖动和无损伤那格的 p50/p95/水位完全相同,
+            # g4 三档 RTT 的 nack_recovered 都是 261, 和不挂 netem 时一字不差。
+            # 脚本正常跑完、汇总齐整, 两组数据全是假的。
+            #
+            # 所以这里逐个设备**量**过去: 挂 10ms 之后 ping 真的慢了才算数。
+            for dev in lo loopback0; do
+                ip link show "$dev" >/dev/null 2>&1 || continue
+                if netem_probe_dev "$dev"; then
+                    NETEM_DEV="$dev"
+                    HAVE_NETEM=1
+                    echo "netem 生效设备: $dev"
+                    break
+                fi
+                echo "  ($dev 上挂得住但不起作用, 换下一个)"
+            done
+
+            if [[ $HAVE_NETEM -eq 0 ]]; then
+                cat >&2 <<'MSG'
+!! 试过的设备上 netem 都挂得住但不起作用 —— 回环包没有被延迟。
+!! 这台机器上要拿到真延迟, 得上 veth + netns, 或者把 .wslconfig 的
+!! networkingMode 切回 NAT 再重启 WSL。
+!! 现在跳过 g3/g4 —— 挂着一个不起作用的 netem 跑出来的数, 和不挂完全一样,
+!! 而那种数**看起来是有效的实验结果**。
+MSG
             fi
         else
             echo "!! 没拿到 sudo, g3/g4 跳过" >&2
@@ -103,10 +139,7 @@ if { wants g3 || wants g4; } && [[ $DRY_RUN -eq 0 ]]; then
     fi
 fi
 if [[ $HAVE_NETEM -eq 0 ]] && { wants g3 || wants g4; }; then
-    cat >&2 <<'MSG'
-!! g3/g4 会被跳过。这两组是 M4.3 自适应水位和"RTT 预算"预测的唯一证据 ——
-!! 跳过它们, 那两条结论就一条都没有。
-MSG
+    echo "!! g3/g4 跳过。这两组是 M4.3 自适应水位和\"17ms 重传预算\"预测的唯一证据。" >&2
 fi
 
 # ---------------------------------------------------------------- 输出目录
@@ -124,7 +157,7 @@ CSV="$OUT/runs.csv"
     echo "frames    $FRAMES @ ${FPS}fps  ${WIDTH}x${HEIGHT} ${BITRATE}kbps"
     echo "seeds     ${SEEDS[*]}"
     echo "groups    ${RUN_GROUPS[*]}"
-    echo "netem     $([[ $HAVE_NETEM -eq 1 ]] && echo available || echo UNAVAILABLE)"
+    echo "netem     $([[ $HAVE_NETEM -eq 1 ]] && echo "生效设备 $NETEM_DEV" || echo UNAVAILABLE)"
     echo
     echo "netem 的 delay 值是单向的; lo 上去程回程各计一次, RTT = 2x。"
     echo "render=null: 走真解码, 不开窗口。SDL 的显示延迟不在这些数里。"
@@ -174,16 +207,32 @@ extract() {
 # ---------------------------------------------------------------- netem
 
 NETEM_ON=0
+
 netem_set() {
     [[ $HAVE_NETEM -eq 1 ]] || return 1
-    sudo -n tc qdisc replace dev lo root netem $1 >/dev/null 2>&1 || return 1
+    sudo -n tc qdisc replace dev "$NETEM_DEV" root netem $1 >/dev/null 2>&1 || return 1
     NETEM_ON=1
+
+    # 每一格都再量一次: 凭据过期、设备被别的东西改掉, 中途都可能让它失效,
+    # 而失效之后 tc 照样返回 0。**"命令成功了"和"命令起作用了"是两件事。**
+    local want rtt
+    want="$(grep -oE 'delay [0-9]+' <<< "$1" | awk '{print $2}')"
+    [[ -z "$want" ]] && return 0
+
+    rtt="$(lo_rtt_ms)"
+    if ! awk -v r="${rtt:-0}" -v w="$want" 'BEGIN { exit !(r + 0 >= w + 0) }'; then
+        echo "  !! netem 挂上了但没生效: 期望 RTT >= ${want}ms, 实测 ${rtt:-?}ms —— 跳过这一格" >&2
+        return 1
+    fi
+    return 0
 }
+
 netem_clear() {
     [[ $NETEM_ON -eq 1 ]] || return 0
-    sudo -n tc qdisc del dev lo root >/dev/null 2>&1
+    sudo -n tc qdisc del dev "$NETEM_DEV" root >/dev/null 2>&1
     NETEM_ON=0
 }
+
 cleanup() {
     netem_clear
     [[ -n "$SUDO_KEEPALIVE" ]] && kill "$SUDO_KEEPALIVE" 2>/dev/null
