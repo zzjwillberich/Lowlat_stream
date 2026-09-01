@@ -78,19 +78,42 @@ HAVE_NETEM=0
 SUDO_KEEPALIVE=""
 NETEM_DEV=""
 
-# 量一次回环往返, 毫秒(浮点); 拿不到回 0。
+# 量一次 127.0.0.1 上的 **UDP** 往返, 毫秒; 拿不到回 -1。
+#
+# **不能用 ping。** 第三轮就栽在这: WSL2 的 mirrored 模式下, netem 挂上 lo 之后
+# ping 确实变慢了, 而两个进程之间的 UDP 一点没被延迟 —— ICMP 和 UDP 走的不是
+# 同一条路。于是探针通过、每一格的检查也通过, g3/g4 十四格全跑完,
+# 数据和不挂 netem 时一字不差。
+#
+# 探针必须和被测流量**同协议、同地址族**, 否则它证明的是别的事。
 lo_rtt_ms() {
+    python3 "$ROOT/scripts/udp_rtt.py" 2>/dev/null || echo -1
+}
+
+# ICMP 往返, 只在报错时用来说明"ping 慢了但 UDP 没慢", 不做判据。
+lo_icmp_ms() {
     ping -c 3 -i 0.2 -W 1 127.0.0.1 2>/dev/null | tail -1 |
         awk -F'[/ ]' '/=/ {for (i = 1; i <= NF; i++)
                               if ($i ~ /^[0-9]+\.[0-9]+$/) { print $(i + 1); exit }}'
 }
 
-# 在 $1 这个设备上挂 10ms 延迟, **实测**回环是不是真的慢了, 然后撤掉。
+# 在 $1 这个设备上挂 10ms 延迟, **用 UDP 实测**是不是真的慢了, 然后撤掉。
 netem_probe_dev() {
     sudo -n tc qdisc replace dev "$1" root netem delay 10ms >/dev/null 2>&1 || return 1
-    local rtt; rtt="$(lo_rtt_ms)"
+    local udp icmp
+    udp="$(lo_rtt_ms)"
+    icmp="$(lo_icmp_ms)"
     sudo -n tc qdisc del dev "$1" root >/dev/null 2>&1
-    awk -v r="${rtt:-0}" 'BEGIN { exit !(r + 0 >= 10) }'
+
+    if awk -v r="${udp:-0}" 'BEGIN { exit !(r + 0 >= 10) }'; then
+        return 0
+    fi
+    printf '  (%s: UDP 往返 %sms — 没生效' "$1" "${udp:-?}" >&2
+    if awk -v i="${icmp:-0}" 'BEGIN { exit !(i + 0 >= 10) }'; then
+        printf '; 注意 ICMP 是 %sms, 说明 ping 走的路和 UDP 不是同一条' "$icmp" >&2
+    fi
+    printf ')\n' >&2
+    return 1
 }
 
 if { wants g3 || wants g4; } && [[ $DRY_RUN -eq 0 ]]; then
@@ -126,7 +149,7 @@ if { wants g3 || wants g4; } && [[ $DRY_RUN -eq 0 ]]; then
 
             if [[ $HAVE_NETEM -eq 0 ]]; then
                 cat >&2 <<'MSG'
-!! 试过的设备上 netem 都挂得住但不起作用 —— 回环包没有被延迟。
+!! 试过的设备上 netem 都挂得住, 但 **UDP** 没有被延迟(ping 可能是慢的, 那不算数)。
 !! 这台机器上要拿到真延迟, 得上 veth + netns, 或者把 .wslconfig 的
 !! networkingMode 切回 NAT 再重启 WSL。
 !! 现在跳过 g3/g4 —— 挂着一个不起作用的 netem 跑出来的数, 和不挂完全一样,
@@ -221,7 +244,7 @@ netem_set() {
 
     rtt="$(lo_rtt_ms)"
     if ! awk -v r="${rtt:-0}" -v w="$want" 'BEGIN { exit !(r + 0 >= w + 0) }'; then
-        echo "  !! netem 挂上了但没生效: 期望 RTT >= ${want}ms, 实测 ${rtt:-?}ms —— 跳过这一格" >&2
+        echo "  !! netem 挂上了但没生效: 期望 UDP 往返 >= ${want}ms, 实测 ${rtt:-?}ms —— 跳过这一格" >&2
         return 1
     fi
     return 0
