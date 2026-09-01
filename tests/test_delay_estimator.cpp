@@ -157,6 +157,41 @@ TEST(DelayEstimatorColdStart, HoldsTheInitialLevelUntilEnoughSamples) {
     EXPECT_EQ(est.stats().windowSize, 29u);
 }
 
+/**
+ * 窗口缩回 minSamples 以下时, 水位**保持不动**, 不许跳回初值。
+ *
+ * 跳回初值是一次瞬时收窄, 绕过了降速限制 —— 而限速存在的全部理由就是
+ * 不让水位突然变窄(收窄 X 毫秒 = 把后面的帧整体提前 X 毫秒放出去, 画面"抽"一下)。
+ *
+ * 构造: 先在高抖动下把水位抬起来, 然后让流停顿一整个窗口, 再来一帧。
+ * 那一帧到达时窗口里只剩它自己, 走的就是样本不足这一支。
+ */
+TEST(DelayEstimatorColdStart, ShrinkingBackBelowMinSamplesHoldsTheLevel) {
+    DelayEstimatorConfig cfg = adaptiveCfg();
+    cfg.minSamples = 10;
+    cfg.windowMs = 500;
+    cfg.targetDelayMs = 20;
+    cfg.downRateMsPerSec = 10;
+    DelayEstimator est(cfg);
+
+    // 一半快一半慢, 把水位抬到远高于初值
+    uint64_t send = 100000;
+    for (int i = 0; i < 40; ++i, send += 10) {
+        est.observe(static_cast<uint32_t>(send), send + (i % 4 == 0 ? 300 : 10));
+    }
+    const int raised = est.stats().currentDelayMs;
+    ASSERT_GT(raised, 100) << "构造没生效: 水位根本没被抬起来";
+
+    // 停顿一整个窗口之后再来一帧 —— 窗口里只剩它自己
+    send += 5000;
+    est.observe(static_cast<uint32_t>(send), send + 10);
+
+    ASSERT_LT(est.stats().windowSize, cfg.minSamples) << "构造没生效: 窗口没缩下去";
+    EXPECT_EQ(est.stats().currentDelayMs, raised)
+        << "样本不足时跳回了初值 " << cfg.targetDelayMs
+        << " —— 这是一次绕过降速限制的瞬时收窄";
+}
+
 // ---------------------------------------------------------------- 非对称跟随
 
 /**

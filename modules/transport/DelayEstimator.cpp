@@ -65,7 +65,12 @@ uint64_t DelayEstimator::observe(uint32_t timestampMs, uint64_t nowMs) {
     const int raw = static_cast<int>(std::clamp(raw64, minInt, maxInt));
 
     if (window_.size() < config_.minSamples) {
-        targetDelayMs_ = config_.targetDelayMs;
+        // 样本不足时**保持不动**, 而不是赋回 config_.targetDelayMs。
+        // 冷启动时两种写法一样(水位本来就是初值); 差别在**窗口缩回边界以下**的时候 ——
+        // 赋回初值等于一次瞬时收窄, 绕过了 downRateMsPerSec, 而那正是限速要挡的事。
+        // 触发路径: 停顿超过一个窗口后恢复, 或者帧率低到 windowMs*fps/1000 恰好
+        // 卡在 minSamples 上(10s 窗口 @3fps 正好 30 个), 样本数在边界两侧来回穿,
+        // 水位就在自适应值和初值之间反复横跳。
     } else if (raw > targetDelayMs_) {
         targetDelayMs_ = raw;
         downRateRemainder_ = 0;
