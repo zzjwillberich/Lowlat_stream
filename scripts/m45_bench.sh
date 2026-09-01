@@ -64,7 +64,7 @@ while [[ $# -gt 0 ]]; do
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done
-[[ ${#RUN_GROUPS[@]} -eq 0 ]] && RUN_GROUPS=(g0 g1 g2 g3 g4 g5)
+[[ ${#RUN_GROUPS[@]} -eq 0 ]] && RUN_GROUPS=(g0 g1 g2 g3 g4 g5 g6)
 
 wants() { for g in "${RUN_GROUPS[@]}"; do [[ "$g" == "$1" ]] && return 0; done; return 1; }
 
@@ -75,17 +75,37 @@ for bin in "$RECV" "$SEND"; do
 done
 
 HAVE_NETEM=0
-if command -v tc >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
-    if sudo -n tc qdisc replace dev lo root netem delay 1ms 2>/dev/null; then
-        sudo -n tc qdisc del dev lo root 2>/dev/null
-        HAVE_NETEM=1
+SUDO_KEEPALIVE=""
+if { wants g3 || wants g4; } && [[ $DRY_RUN -eq 0 ]]; then
+    if ! command -v tc >/dev/null 2>&1; then
+        echo "!! 找不到 tc, g3/g4 跳过 (apt install iproute2)" >&2
+    else
+        echo "g3/g4 要给 lo 挂 netem, 现在申请一次 sudo (只在这里问一次):"
+        if sudo -v; then
+            # 探针用**真正要用的那条语法**(带抖动的 delay), 不是 `delay 1ms` ——
+            # 探针和实际命令不一样的话, 语法问题会在 20 分钟后才暴露。
+            if sudo -n tc qdisc replace dev lo root netem delay 10ms 5ms 2>/dev/null; then
+                sudo -n tc qdisc del dev lo root 2>/dev/null
+                HAVE_NETEM=1
+
+                # sudo 凭据默认 15 分钟过期, 而全量要跑一个钟头。
+                # 第一次跑就是这么废掉的: 探针在第 0 分钟通过, g3 在第 20 分钟开始,
+                # 那时 `sudo -n` 已经要密码了 —— 每一格都打印"设置失败"然后跳过,
+                # 脚本正常退出、返回 0。**最需要的两组就这样没了, 而且不报错。**
+                ( while sudo -n true 2>/dev/null; do sleep 60; done ) &
+                SUDO_KEEPALIVE=$!
+            else
+                echo "!! netem 挂不上 lo, g3/g4 跳过 (查 sch_netem 模块)" >&2
+            fi
+        else
+            echo "!! 没拿到 sudo, g3/g4 跳过" >&2
+        fi
     fi
 fi
 if [[ $HAVE_NETEM -eq 0 ]] && { wants g3 || wants g4; }; then
     cat >&2 <<'MSG'
-!! tc netem 用不了, g3/g4 会被跳过。
-!! 这两组是 M4.3 自适应水位和"RTT 预算"预测的唯一证据, 跳过它们等于没测。
-!! 先跑一次 `sudo -v` 把 sudo 凭据缓存起来, 再重跑本脚本。
+!! g3/g4 会被跳过。这两组是 M4.3 自适应水位和"RTT 预算"预测的唯一证据 ——
+!! 跳过它们, 那两条结论就一条都没有。
 MSG
 fi
 
@@ -110,7 +130,9 @@ CSV="$OUT/runs.csv"
     echo "render=null: 走真解码, 不开窗口。SDL 的显示延迟不在这些数里。"
 } > "$OUT/meta.txt"
 
-RX_KEYS="frames packets injected_drops lost_exact nack_pending nack_sent nack_seqs nack_recovered nack_gaveup fec_recv fec_recovered fec_unrecoverable pli_sent pli_suppressed jitter_dropped queue_dropped resyncs decoded rendered jitter_delay jitter_peak malformed recv_errors elapsed"
+# dropped(组包器丢的整帧)第一次跑漏掉了 —— 而"组好了几帧"和"解出来几帧"
+# 之间的缺口正是这次最重要的发现, 少一个计数器就得靠推断。
+RX_KEYS="frames key packets injected_drops lost_exact nack_pending nack_sent nack_seqs nack_recovered nack_gaveup fec_recv fec_recovered fec_unrecoverable pli_sent pli_suppressed dropped jitter_dropped queue_dropped resyncs decoded rendered jitter_delay jitter_peak malformed recv_errors elapsed"
 TX_KEYS="captured encoded bytes key packets_sent send_errors nacks nacked_seqs retransmitted retx_misses reverse_malformed plis fec_packets fec_bytes"
 LAT_KEYS="samples p50 p95 p99 max"
 
@@ -162,7 +184,11 @@ netem_clear() {
     sudo -n tc qdisc del dev lo root >/dev/null 2>&1
     NETEM_ON=0
 }
-trap 'netem_clear' EXIT INT TERM
+cleanup() {
+    netem_clear
+    [[ -n "$SUDO_KEEPALIVE" ]] && kill "$SUDO_KEEPALIVE" 2>/dev/null
+}
+trap cleanup EXIT INT TERM
 
 # ---------------------------------------------------------------- 单次运行
 
@@ -222,7 +248,7 @@ run_one() {
 
     local rendered; rendered="$(cut -d, -f1 <<< "$(extract "$rlog" "stopped:" rendered)")"
     printf '  %-26s rendered=%-6s p95=%-5s 水位=%sms\n' "$tag" \
-           "${rendered:-?}" "$(cut -d, -f3 <<< "$lat")" "$(cut -d, -f20 <<< "$rx")"
+           "${rendered:-?}" "$(cut -d, -f3 <<< "$lat")" "$(cut -d, -f22 <<< "$rx")"
 }
 
 # 跑一格: 同样的配置, 每个种子跑一遍
@@ -252,12 +278,47 @@ PLI_OFF="--pli-ms=0"
 # 代价是这几格的 nack_sent 不为 0(反向通道上确实发了), 读表时别误认为重传开着。
 RETX_OFF="--retx-ms=0"
 
+# 组的顺序: **脆的先跑**。g3/g4 依赖 sudo 和 netem, 是唯一会中途失效的东西;
+# 排在两个钟头的实验末尾, 一旦失效就是白等。g0 仍然排最前 —— 它是自检,
+# 它要是不干净, 后面全部不用跑。
+
 # ================================================================= G0 基线
 # 无损伤。建立地板, 并顺便确认: 无损伤时每一个丢包/恢复计数器都必须是 0。
 # 任何一个非 0 都说明测量工具自己有问题, 后面五组全部不用看了。
 if wants g0; then
     echo "=== G0 基线(无损伤) ==="
     run_cell g0 clean "" "" ""
+fi
+
+# ================================================================= G3 抖动
+# M4.3 自适应水位的**唯一存在证明**。回环上 d≈0, 正确实现和"直接 return 下限"
+# 的假实现输出一模一样 —— 只有真抖动能把两者分开。
+#
+# 要看的是**交换比**: 自适应应当用更少的延迟换到同样的不丢帧, 或者同样的延迟
+# 换到更少的丢帧。两个都没改善就是白做, 那结论也要照实写。
+if wants g3 && { [[ $HAVE_NETEM -eq 1 ]] || [[ $DRY_RUN -eq 1 ]]; }; then
+    echo "=== G3 抖动 x 自适应水位 ==="
+    for j in "delay 10ms 5ms" "delay 20ms 10ms" "delay 30ms 15ms"; do
+        label="j$(tr -dc '0-9 ' <<< "$j" | awk '{print $1"_"$2}')"
+        run_cell g3 "${label}_fixed" "$j" "--jitter-adapt=0" ""
+        run_cell g3 "${label}_adapt" "$j" "--jitter-adapt=1" ""
+    done
+    # 无抖动时的对照: 自适应不该在干净链路上白付延迟
+    run_cell g3 "clean_fixed" "" "--jitter-adapt=0" ""
+    run_cell g3 "clean_adapt" "" "--jitter-adapt=1" ""
+fi
+
+# ================================================================= G4 RTT
+# 验证设计阶段的一个预测: 抖动 50ms - 检测延迟 33ms(一个帧周期) = 17ms 重传预算,
+# 所以 RTT 过 ~17ms 之后 NACK 应当迅速失效, FEC 接管。
+#
+# **推翻它比证实它值钱** —— 那说明我们对这条链路的理解有洞。
+# 看 nack_recovered 和 fec_recovered 的此消彼长。
+if wants g4 && { [[ $HAVE_NETEM -eq 1 ]] || [[ $DRY_RUN -eq 1 ]]; }; then
+    echo "=== G4 RTT x NACK 预算 ==="
+    for d in 5 15 25; do   # 单向; RTT = 10/30/50ms
+        run_cell g4 "rtt$((d * 2))" "delay ${d}ms" "--loss=10" ""
+    done
 fi
 
 # ================================================================= G1 消融
@@ -284,37 +345,6 @@ if wants g2; then
     done
 fi
 
-# ================================================================= G3 抖动
-# M4.3 自适应水位的**唯一存在证明**。回环上 d≈0, 正确实现和"直接 return 下限"
-# 的假实现输出一模一样 —— 只有真抖动能把两者分开。
-#
-# 要看的是**交换比**: 自适应应当用更少的延迟换到同样的不丢帧, 或者同样的延迟
-# 换到更少的丢帧。两个都没改善就是白做, 那结论也要照实写。
-if wants g3 && [[ $HAVE_NETEM -eq 1 ]]; then
-    echo "=== G3 抖动 x 自适应水位 ==="
-    for j in "delay 10ms 5ms" "delay 20ms 10ms" "delay 30ms 15ms"; do
-        label="j$(tr -dc '0-9 ' <<< "$j" | awk '{print $1"_"$2}')"
-        run_cell g3 "${label}_fixed" "$j" "--jitter-adapt=0" ""
-        run_cell g3 "${label}_adapt" "$j" "--jitter-adapt=1" ""
-    done
-    # 无抖动时的对照: 自适应不该在干净链路上白付延迟
-    run_cell g3 "clean_fixed" "" "--jitter-adapt=0" ""
-    run_cell g3 "clean_adapt" "" "--jitter-adapt=1" ""
-fi
-
-# ================================================================= G4 RTT
-# 验证设计阶段的一个预测: 抖动 50ms - 检测延迟 33ms(一个帧周期) = 17ms 重传预算,
-# 所以 RTT 过 ~17ms 之后 NACK 应当迅速失效, FEC 接管。
-#
-# **推翻它比证实它值钱** —— 那说明我们对这条链路的理解有洞。
-# 看 nack_recovered 和 fec_recovered 的此消彼长。
-if wants g4 && [[ $HAVE_NETEM -eq 1 ]]; then
-    echo "=== G4 RTT x NACK 预算 ==="
-    for d in 5 15 25; do   # 单向; RTT = 10/30/50ms
-        run_cell g4 "rtt$((d * 2))" "delay ${d}ms" "--loss=10" ""
-    done
-fi
-
 # ================================================================= G5 PLI 风暴
 # IDR 约 25 个分片, 0.9^25 = 7.2% —— 10% 丢包下一个 IDR 整帧到达的概率只有 7%。
 # 于是 PLI -> IDR -> 大概率又丢 -> 再 PLI, 正反馈。
@@ -326,6 +356,23 @@ if wants g5; then
     run_cell g5 pli_off "" "--loss=30 $PLI_OFF" "--gop=30"
     run_cell g5 pli_1s  "" "--loss=30 --pli-ms=1000" "--gop=30"
     run_cell g5 pli_100 "" "--loss=30 --pli-ms=100"  "--gop=30"
+fi
+
+# ================================================================= G6 参考链放大
+# 第一轮跑出来的现象: loss5 那格组好了 1000 帧、jitter 只丢了 1 帧,
+# 解码器却只吐出 987 帧。缺口 13, 而 gop=30 —— **一帧丢掉连累了约半个 GOP**。
+#
+# 那是"约等于"不是"测出来"。这一组把 gop 拉成 10/30/60 去验:
+# 缺口跟着 gop 走就说明机制是参考链断裂; 不跟着走就说明另有原因,
+# 那条结论也就不能写进报告。
+#
+# 选 loss=5 是因为它是第一轮里缺口最大的那一格(水位停在 10ms 下限,
+# 接不住重传往返, 于是偶尔掉一帧)。
+if wants g6; then
+    echo "=== G6 一帧丢失连累多少帧 (gop 扫描 @5% 丢包) ==="
+    for g in 10 30 60; do
+        run_cell g6 "gop$g" "" "--loss=5" "--gop=$g"
+    done
 fi
 
 netem_clear
