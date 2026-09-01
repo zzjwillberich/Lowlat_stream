@@ -534,9 +534,9 @@ TEST(DelayEstimatorBudget, MeasuresTheFrameIntervalFromTimestamps) {
 }
 
 /**
- * 帧周期用**中位数**, 一次乱序歪不了它。
+ * 帧周期用低分位, 一次乱序歪不了它。
  *
- * 乱序时相邻两帧的时间戳差会变成 0 或两倍, 用均值会被拖偏。
+ * 乱序时相邻两帧的时间戳绝对差会变成多倍帧周期, 用均值会被拖偏。
  */
 TEST(DelayEstimatorBudget, TheFrameIntervalSurvivesReordering) {
     DelayEstimatorConfig cfg = adaptiveCfg();
@@ -553,10 +553,59 @@ TEST(DelayEstimatorBudget, TheFrameIntervalSurvivesReordering) {
 }
 
 /**
+ * 乱序相邻对过半时中位数会偏大, 但正常相邻对只要超过四分之一,
+ * p25 仍应落在真实帧周期上。
+ */
+TEST(DelayEstimatorBudget, LowPercentileSurvivesMajorityReordering) {
+    DelayEstimatorConfig cfg = adaptiveCfg();
+    DelayEstimator est(cfg);
+
+    const std::vector<int> arrivalOrder = {0, 1, 4, 2, 5, 3, 6, 7,
+                                           10, 8, 11, 9, 12, 13, 14, 15};
+    const uint64_t base = 100000;
+    for (size_t i = 0; i < arrivalOrder.size(); ++i) {
+        const uint64_t ts = base + static_cast<uint64_t>(arrivalOrder[i]) * 33;
+        est.observe(static_cast<uint32_t>(ts), base + i * 33 + 5);
+    }
+
+    EXPECT_EQ(est.stats().frameIntervalMs, 33);
+}
+
+/**
+ * 几个异常**小**的差值不许把帧周期拉下去。
+ *
+ * 这条是"为什么不取 min"的契约。取 min 的话, 单独一对挨得极近的时间戳
+ * 就能把帧周期打成 1ms —— 而帧周期一旦接近 0, 重传预算
+ * (帧周期 + RTT)就等于只剩 RTT, 水位下限**静默失效**,
+ * 回到 M4.5 第四轮那个双稳的坑里。
+ *
+ * 而且失效得毫无痕迹: 所有计数器都正常, 只是水位比该有的低。
+ *
+ * @note 这条**不钉死具体分位数**, 只钉"扛得住两个异常值"。
+ *          15 个样本里 p25 落在第 3 个, 两个异常值动不了它;
+ *          min 和 p10 都会被打穿。分位数还能往上调, 但不能往下。
+ */
+TEST(DelayEstimatorBudget, ACoupleOfTinyDeltasCannotDragTheIntervalDown) {
+    DelayEstimatorConfig cfg = adaptiveCfg();
+    DelayEstimator est(cfg);
+
+    // 33ms 一帧的正常流, 中间插两对挨得极近的时间戳
+    const uint64_t base = 100000;
+    uint64_t ts = base;
+    for (int i = 0; i < 30; ++i) {
+        est.observe(static_cast<uint32_t>(ts), base + static_cast<uint64_t>(i) * 33 + 5);
+        ts += (i == 20 || i == 24) ? 1 : 33;
+    }
+
+    EXPECT_EQ(est.stats().frameIntervalMs, 33)
+        << "两个异常小值就把帧周期拉走了 —— 重传预算会静默失效";
+}
+
+/**
  * timestampMs 回绕不能把帧周期顶到天上。
  *
- * @note 这条测的是**结果**, 不是某一层实现。挡住它的其实是中位数:
- *          一次回绕只污染一个样本, 15 个样本的中位数不动。
+ * @note 这条测的是**结果**, 不是某一层实现。挡住它的其实是低分位:
+ *          一次回绕只污染一个样本, 15 个样本的低分位不动。
  *          变异验证确认过 —— 把 int32 做差换成 int64, 这条照样全绿。
  *          int32 那一层是把回绕计数器的语义写对, 不是这条的防线。
  *          最初的设计注释把功劳记反了, 留着这条注释免得下次又反过来。
@@ -571,7 +620,7 @@ TEST(DelayEstimatorBudget, AWrappedTimestampDoesNotBlowTheFrameInterval) {
         est.observe(ts, 100000 + static_cast<uint64_t>(i) * 33);
     }
     EXPECT_NEAR(est.stats().frameIntervalMs, 33, 2)
-        << "回绕点用无符号减法, 一个样本就能把帧周期顶到十亿";
+        << "回绕把帧周期顶飞了";
 }
 
 /**

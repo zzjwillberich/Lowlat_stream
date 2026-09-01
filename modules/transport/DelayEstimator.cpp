@@ -165,9 +165,11 @@ void DelayEstimator::updateFrameInterval(uint32_t timestampMs) {
     scratch_.clear();
     scratch_.reserve(frameDeltas_.size());
     for (int sample : frameDeltas_) scratch_.push_back(sample);
-    const size_t middle = scratch_.size() / 2;
-    std::nth_element(scratch_.begin(), scratch_.begin() + middle, scratch_.end());
-    stats_.frameIntervalMs = static_cast<int>(scratch_[middle]);
+    // 到达乱序只会把相邻时间戳的绝对差放大；p25 因此比中位数更接近
+    // 正常顺序下的真实帧周期，同时又不像 min 那样容易被异常小值击穿。
+    const size_t index = scratch_.size() / 4;
+    std::nth_element(scratch_.begin(), scratch_.begin() + index, scratch_.end());
+    stats_.frameIntervalMs = static_cast<int>(scratch_[index]);
 }
 
 int64_t DelayEstimator::percentileOffset(int percentile) const {

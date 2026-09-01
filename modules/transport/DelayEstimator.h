@@ -218,7 +218,7 @@ struct DelayEstimatorStats {
     /** @brief 当前生效的下限是不是由重传预算给出的(而非 minDelayMs) */
     bool floorFromBudget = false;
 
-    /** @brief 实测帧周期(毫秒); 由相邻 timestampMs 的差值中位数得到 */
+    /** @brief 实测帧周期(毫秒); 由相邻 timestampMs 的绝对差 p25 得到 */
     int frameIntervalMs = 0;
 
     /** @brief 外部喂进来的实测 RTT(毫秒); 0 表示还不知道 */
@@ -333,14 +333,26 @@ private:
      *
      * @param timestampMs 本帧的发送端时间戳
      *
-     * @note 取**中位数**而不是均值: 帧会乱序到达, 乱序时相邻两帧的差值是负的或很大,
-     *          均值会被拖偏而中位数不会。
+     * @note 取绝对差的 **p25**: 乱序只会把相邻时间戳的绝对差放大, 不会缩小,
+     *          所以真实帧周期位于分布低端。只要正常相邻对超过 25%, p25 就仍是
+     *          真实帧周期；中位数在乱序对过半时会被向上污染。
+     * @note 不取 min, 也不取更低的分位: 单独几对挨得极近的时间戳就能把帧周期
+     *          打到接近 0, 而帧周期一旦为 0, 重传预算(帧周期 + RTT)就只剩 RTT,
+     *          水位下限**静默失效** —— 回到 M4.5 第四轮那个双稳的坑, 且毫无痕迹。
+     *          契约见 ACoupleOfTinyDeltasCannotDragTheIntervalDown:
+     *          它只要求"扛得住两个异常值", 分位数可以往上调、不能往下。
+     *
+     * @note p25 依赖**正常相邻对超过 25%**, 而这个占比会随丢包率和 RTT 一起下降
+     *          (乱序的帧越多, 正常相邻对越少)。它是个有边界的假设, 不是恒真的性质。
+     *          失效的信号是 stats.frameIntervalMs 明显大于 1000/fps ——
+     *          真要跌破 25%, 就得换掉这个代理: 检测延迟本来就该直接量
+     *          (缺口出现 -> NACK 发出), 帧周期只是它的一个会漏的替身。
      *
      * @note 差值用 int32 做 —— timestampMs 会回绕, 无符号减法在回绕点给出
      *          十亿级的差。这是回绕计数器的正确语义。
-     *          **但它不是防线**: 一次回绕只污染一个样本, 而 15 个样本的中位数
+     *          **但它不是防线**: 一次回绕只污染一个样本, 而 15 个样本的低分位
      *          根本不动。变异验证确认过(换成 int64 做差, 那条回绕用例照样全绿) ——
-     *          真正挡住这件事的是中位数, int32 只是把语义写对。
+     *          真正挡住这件事的是低分位, int32 只是把语义写对。
      *          记在这里是因为最初的设计注释把功劳记在了错的那一层上。
      */
     void updateFrameInterval(uint32_t timestampMs);
@@ -392,7 +404,7 @@ private:
     /** @brief 外部喂进来的实测 RTT; 0 = 还不知道 */
     int rttMs_ = 0;
 
-    /** @brief 最近若干个相邻 timestampMs 的差值(毫秒), 取中位数当帧周期 */
+    /** @brief 最近若干个相邻 timestampMs 的绝对差(毫秒), 取 p25 当帧周期 */
     std::deque<int> frameDeltas_;
     uint32_t lastTimestampMs_ = 0;
     bool hasLastTimestamp_ = false;
