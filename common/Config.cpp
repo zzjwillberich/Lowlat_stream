@@ -245,7 +245,8 @@ void Config::printUsage() const {
         "                        0 pins it at --jitter-ms; that is the M3 baseline.\n"
         "  --jitter-window-ms <n> Sliding window for the estimate (default: 10000)\n"
         "  --jitter-pct <n>      Percentile the level tracks, 0-100 (default: 95)\n"
-        "  --jitter-min-ms <n>   Lower bound on the level (default: 10)\n"
+        "  --jitter-min-ms <n>   Absolute lower bound on the level (default: 5)\n"
+        "                        The effective floor is max(this, frame interval + RTT).\n"
         "  --jitter-max-ms <n>   Upper bound on the level (default: 500)\n"
         "  --jitter-down-rate <n> Max shrink rate in ms/s; growth is instant (default: 10)\n"
     );

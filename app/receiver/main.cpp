@@ -51,7 +51,11 @@ namespace {
         pipeline.jitter.delay.windowMs =
             static_cast<uint32_t>(std::max(0, config.getInt("jitter-window-ms", 10000)));
         pipeline.jitter.delay.delayPercentile = config.getInt("jitter-pct", 95);
-        pipeline.jitter.delay.minDelayMs = config.getInt("jitter-min-ms", 10);
+        // 5 而不是 10: 这个数只是**绝对**下限("干净链路上别收到 0"),
+        // 接得住重传是 帧周期+RTT 那条预算的职责。两个默认值必须一致 ——
+        // 结构体里写 5 而这里传 10 的话, 单测和产品跑的是两套下限,
+        // 而单测**永远看不到**那个差异。
+        pipeline.jitter.delay.minDelayMs = config.getInt("jitter-min-ms", 5);
         pipeline.jitter.delay.maxDelayMs = config.getInt("jitter-max-ms", 500);
         pipeline.jitter.delay.downRateMsPerSec = config.getInt("jitter-down-rate", 10);
         pipeline.decoder.threads = config.getInt("threads", 1);
