@@ -18,7 +18,10 @@ import time
 
 
 def main():
-    count = int(sys.argv[1]) if len(sys.argv) > 1 else 7
+    # 21 个而不是 7 个: netem 的 jitter 是**均匀分布**, 7 个样本的中位数抖得厉害。
+    # 第四轮就因此误杀了三格 —— delay 20ms 10ms 是 [10,30] 上的均匀分布,
+    # 7 个样本的中位数实测 15.3, 而判据要求 >= 20。判据设计错了, 不是 netem 的问题。
+    count = int(sys.argv[1]) if len(sys.argv) > 1 else 21
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(("127.0.0.1", 0))

@@ -242,9 +242,13 @@ netem_set() {
     want="$(grep -oE 'delay [0-9]+' <<< "$1" | awk '{print $2}')"
     [[ -z "$want" ]] && return 0
 
+    # 判据只需要区分**生效**和**完全没生效**, 而这两者相差 100 倍
+    # (没生效时回环 UDP 往返是 0.15ms 量级)。所以阈值取配置值的一半就够,
+    # 不要取配置值本身 —— netem 的 jitter 是均匀分布, 中位数落在配置值下方
+    # 是常态, 卡满会随机误杀。第四轮的 j20_10 / j30_15 就是这么丢的三格。
     rtt="$(lo_rtt_ms)"
-    if ! awk -v r="${rtt:-0}" -v w="$want" 'BEGIN { exit !(r + 0 >= w + 0) }'; then
-        echo "  !! netem 挂上了但没生效: 期望 UDP 往返 >= ${want}ms, 实测 ${rtt:-?}ms —— 跳过这一格" >&2
+    if ! awk -v r="${rtt:-0}" -v w="$want" 'BEGIN { exit !(r + 0 >= w * 0.5) }'; then
+        echo "  !! netem 挂上了但没生效: 期望 UDP 往返 >= $(awk -v w="$want" 'BEGIN{printf "%.0f", w*0.5}')ms, 实测 ${rtt:-?}ms —— 跳过这一格" >&2
         return 1
     fi
     return 0
