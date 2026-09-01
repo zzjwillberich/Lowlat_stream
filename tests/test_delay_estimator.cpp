@@ -555,8 +555,11 @@ TEST(DelayEstimatorBudget, TheFrameIntervalSurvivesReordering) {
 /**
  * timestampMs 回绕不能把帧周期顶到天上。
  *
- * 无符号减法在回绕点给出十亿级的差 —— 一个样本就够。
- * 必须用 int32_t 做差。
+ * @note 这条测的是**结果**, 不是某一层实现。挡住它的其实是中位数:
+ *          一次回绕只污染一个样本, 15 个样本的中位数不动。
+ *          变异验证确认过 —— 把 int32 做差换成 int64, 这条照样全绿。
+ *          int32 那一层是把回绕计数器的语义写对, 不是这条的防线。
+ *          最初的设计注释把功劳记反了, 留着这条注释免得下次又反过来。
  */
 TEST(DelayEstimatorBudget, AWrappedTimestampDoesNotBlowTheFrameInterval) {
     DelayEstimatorConfig cfg = adaptiveCfg();

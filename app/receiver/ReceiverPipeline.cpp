@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <thread>
 #include <utility>
 
@@ -257,6 +258,7 @@ void ReceiverPipeline::recvLoop(const std::atomic<bool>& stopRequested) {
                     (void)assembler_.offer(recvBuf_.data(), receivedBytes);
                 } else if (header.type == PacketType::Data) {
                     trackPeer(recvBuf_.data(), receivedBytes, from);
+                    observeRetransmit(recvBuf_.data(), receivedBytes, now);
                     requestRetransmissions(recvBuf_.data(), receivedBytes);
 
                     DataHeader dataHeader;
@@ -535,6 +537,7 @@ void ReceiverPipeline::publishRecvStats() {
     shared_.delay = jitter_.delayStats();
     shared_.rttMs = rttMs_.load();
     shared_.rttSamples = rttSampleCount_.load();
+    shared_.rttPending = rttPendingCount_.load();
     shared_.decodeQueuePeak = queueA_.peak();
     shared_.renderQueuePeak = queueB_.peak();
     shared_.decodeQueueDropped = queueA_.dropped() + decodeQueueRejected_.load();
@@ -613,36 +616,48 @@ bool ReceiverPipeline::requestKeyFrame(uint64_t nowMs) {
 }
 
 void ReceiverPipeline::recordNackSent(const std::vector<uint32_t>& seqs, uint64_t nowMs) {
-    // TODO(M4.6):
-    //   1. 逐个 seq 写进 nackSentAtMs_。**已经在表里的不要覆盖** ——
-    //      重发第二次时覆盖成新时刻, 量出来的就是"第二次请求到回包"的时间,
-    //      比真实 RTT 短。第一次请求的时刻才是这一趟的起点。
-    //   2. 表超过 kRttPendingMax 就从**最老的 seq** 开始丢
-    //      (std::map 按 seq 有序, begin() 就是最老的 —— 除非 seq 回绕了,
-    //       而那种情况下丢错几个只影响 RTT 采样, 不影响正确性)。
-    (void)seqs;
-    (void)nowMs;
+    for (uint32_t seq : seqs) nackSentAtMs_.emplace(seq, nowMs);
+    while (nackSentAtMs_.size() > kRttPendingMax) {
+        nackSentAtMs_.erase(nackSentAtMs_.begin());
+    }
+    rttPendingCount_.store(nackSentAtMs_.size());
 }
 
 void ReceiverPipeline::observeRetransmit(const uint8_t* packet, size_t len,
                                          uint64_t nowMs) {
-    // TODO(M4.6):
-    //   1. 解包头; 不是 Data 就返回
-    //   2. 解 DataHeader; 没有 FLAG_RETRANSMIT 就返回
-    //      **这一步不能省**: 请求刚发出去、原包正好到达是常事,
-    //      把它当成重传会量出接近 0 的 RTT, 而 RTT 要去当水位下限 ——
-    //      低估的下限比没有下限更糟, 因为它看起来像是量过的。
-    //   3. 在 nackSentAtMs_ 里找这个 seq; 找不到就返回
-    //   4. rtt = nowMs - sentAt; **nowMs < sentAt 时直接丢弃这个样本**
-    //      (同 RetransmitCache::evictExpired 的倒退时钟守卫)
-    //   5. 从表里删掉这个 seq, rtt 压进 rttSamples_, 超过 kRttWindow 弹掉最老的
-    //   6. 取中位数写进 rttMs_(atomic), ++rttSampleCount_
-    //   7. jitter_.setRttMs(中位数)
-    //      **jitter_ 归收包线程独占**, 而本函数也在收包线程里 —— 不需要加锁。
-    //      要是哪天挪到别的线程, 这一句就得改。
-    (void)packet;
-    (void)len;
-    (void)nowMs;
+    PacketHeader header;
+    if (!decodePacketHeader(packet, len, header).isOk() ||
+        header.type != PacketType::Data) {
+        return;
+    }
+
+    DataHeader dataHeader;
+    if (!decodeDataHeader(packet + PACKET_HEADER_SIZE, len - PACKET_HEADER_SIZE,
+                          dataHeader)
+             .isOk() ||
+        (dataHeader.flags & DataHeader::FLAG_RETRANSMIT) == 0) {
+        return;
+    }
+
+    const auto sent = nackSentAtMs_.find(header.seq);
+    if (sent == nackSentAtMs_.end() || nowMs < sent->second) return;
+
+    const uint64_t elapsed = nowMs - sent->second;
+    const int rtt = static_cast<int>(std::min(
+        elapsed, static_cast<uint64_t>(std::numeric_limits<int>::max())));
+    nackSentAtMs_.erase(sent);
+    rttPendingCount_.store(nackSentAtMs_.size());
+
+    rttSamples_.push_back(rtt);
+    if (rttSamples_.size() > kRttWindow) rttSamples_.pop_front();
+
+    std::vector<int> sorted(rttSamples_.begin(), rttSamples_.end());
+    const size_t middle = sorted.size() / 2;
+    std::nth_element(sorted.begin(), sorted.begin() + middle, sorted.end());
+    const int median = sorted[middle];
+    rttMs_.store(median);
+    ++rttSampleCount_;
+    jitter_.setRttMs(median);
 }
 
 void ReceiverPipeline::requestRetransmissions(const uint8_t* packet, size_t len) {
@@ -706,9 +721,7 @@ void ReceiverPipeline::requestRetransmissions(const uint8_t* packet, size_t len)
     const Status sendStatus = socket_.sendTo(peer_, nackBuf_.data(), nackLen);
     if (sendStatus.isOk()) {
         ++nackPacketsSent_;
-        // TODO(M4.6): recordNackSent(nackTargets_, steadyNowMs());
-        //   放在 isOk() 里面 —— 没发出去的请求不该等回包, 否则表里会积一堆
-        //   永远等不到的 seq, 把真正在飞的挤掉。
+        recordNackSent(nackTargets_, steadyNowMs());
     } else {
         ++nackSendErrors_;
     }

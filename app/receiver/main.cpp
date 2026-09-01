@@ -126,6 +126,7 @@ int main(int argc, char** argv) {
              "pli_sent=%llu pli_suppressed=%llu "
              "jitter_delay=%dms jitter_peak=%dms jitter_raw=%dms "
              "jitter_floor=%dms floor_src=%s frame_int=%dms rtt=%dms rtt_n=%llu "
+             "rtt_pending=%zu "
              "sampled_dropped=%llu decoded=%llu "
              "rendered=%llu queue_peak=%zu/%zu elapsed=%llums",
              static_cast<unsigned long long>(stats.framesWritten),
@@ -160,6 +161,7 @@ int main(int argc, char** argv) {
              stats.delay.floorFromBudget ? "budget" : "min",
              stats.delay.frameIntervalMs, stats.rttMs,
              static_cast<unsigned long long>(stats.rttSamples),
+             stats.rttPending,
              static_cast<unsigned long long>(stats.jitter.framesSampledButDropped),
              static_cast<unsigned long long>(stats.decoder.framesOut),
              static_cast<unsigned long long>(stats.renderer.framesRendered),

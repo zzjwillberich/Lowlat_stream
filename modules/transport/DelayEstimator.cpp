@@ -23,6 +23,7 @@ DelayEstimator::DelayEstimator(DelayEstimatorConfig config) : config_(std::move(
     stats_.currentDelayMs = targetDelayMs_;
     stats_.rawDelayMs = targetDelayMs_;
     stats_.peakDelayMs = targetDelayMs_;
+    stats_.effectiveMinDelayMs = config_.minDelayMs;
 }
 
 uint64_t DelayEstimator::observe(uint32_t timestampMs, uint64_t nowMs) {
@@ -107,23 +108,22 @@ uint64_t DelayEstimator::observe(uint32_t timestampMs, uint64_t nowMs) {
         }
     }
 
-    // TODO(M4.6) 下限改成 max(minDelayMs, 帧周期 + RTT):
-    //   const int budget = (rttMs_ > 0 && stats_.frameIntervalMs > 0)
-    //                          ? stats_.frameIntervalMs + rttMs_ : 0;
-    //   const int floor = std::max(config_.minDelayMs, budget);
-    //   stats_.effectiveMinDelayMs = floor;
-    //   stats_.floorFromBudget = budget > config_.minDelayMs;
-    //   然后拿 floor 代替下面的 config_.minDelayMs。
-    //
-    //   **上限仍然优先**: RTT 测歪了的话 floor 可能大过 maxDelayMs,
-    //   而 maxDelayMs 是产品定义的上限(过 500ms README 第一行就不成立),
-    //   不能被一个测量值突破。所以顺序是先判上限、再判下限,
-    //   且 floor 自己也要先夹进 [minDelayMs, maxDelayMs]。
+    int budget = 0;
+    if (rttMs_ > 0 && stats_.frameIntervalMs > 0) {
+        const int64_t sum = static_cast<int64_t>(stats_.frameIntervalMs) + rttMs_;
+        budget = static_cast<int>(
+            std::min(sum, static_cast<int64_t>(std::numeric_limits<int>::max())));
+    }
+    const int floor = std::clamp(std::max(config_.minDelayMs, budget),
+                                 config_.minDelayMs, config_.maxDelayMs);
+    stats_.effectiveMinDelayMs = floor;
+    stats_.floorFromBudget = budget > config_.minDelayMs;
+
     if (targetDelayMs_ > config_.maxDelayMs) {
         targetDelayMs_ = config_.maxDelayMs;
         ++stats_.clampedHigh;
-    } else if (targetDelayMs_ < config_.minDelayMs) {
-        targetDelayMs_ = config_.minDelayMs;
+    } else if (targetDelayMs_ < floor) {
+        targetDelayMs_ = floor;
         ++stats_.clampedLow;
     }
 
@@ -140,21 +140,34 @@ uint64_t DelayEstimator::observe(uint32_t timestampMs, uint64_t nowMs) {
 }
 
 void DelayEstimator::setRttMs(int rttMs) {
-    // TODO(M4.6): rttMs > 0 时记进 rttMs_ 并同步 stats_.rttMs; <= 0 忽略(保持旧值)。
-    //   **不要**在这里改 targetDelayMs_ —— 预算只抬下限, 下限在 observe 里参与夹取。
-    (void)rttMs;
+    if (rttMs <= 0) return;
+    rttMs_ = rttMs;
+    stats_.rttMs = rttMs_;
 }
 
 void DelayEstimator::updateFrameInterval(uint32_t timestampMs) {
-    // TODO(M4.6):
-    //   1. 第一帧只记 lastTimestampMs_ / hasLastTimestamp_ 就返回
-    //   2. delta = abs(static_cast<int32_t>(timestampMs - lastTimestampMs_))
-    //      **必须用 int32_t 做差**: timestampMs 会回绕, 无符号减法在回绕点
-    //      给出十亿级的差, 一个样本就能把帧周期顶到天上。
-    //   3. delta 压进 frameDeltas_, 超过 kFrameDeltaWindow 就从前面弹掉
-    //   4. 取中位数(拷一份用 nth_element, 同 percentileOffset)写进 stats_.frameIntervalMs
-    //   **中位数不是均值**: 帧乱序时相邻差值会是 0 或两倍, 均值被拖偏而中位数不会。
-    (void)timestampMs;
+    if (!hasLastTimestamp_) {
+        lastTimestampMs_ = timestampMs;
+        hasLastTimestamp_ = true;
+        return;
+    }
+
+    const int64_t signedDelta =
+        static_cast<int32_t>(timestampMs - lastTimestampMs_);
+    lastTimestampMs_ = timestampMs;
+    const int64_t magnitude = signedDelta < 0 ? -signedDelta : signedDelta;
+    const int delta = static_cast<int>(std::min(
+        magnitude, static_cast<int64_t>(std::numeric_limits<int>::max())));
+
+    frameDeltas_.push_back(delta);
+    if (frameDeltas_.size() > kFrameDeltaWindow) frameDeltas_.pop_front();
+
+    scratch_.clear();
+    scratch_.reserve(frameDeltas_.size());
+    for (int sample : frameDeltas_) scratch_.push_back(sample);
+    const size_t middle = scratch_.size() / 2;
+    std::nth_element(scratch_.begin(), scratch_.begin() + middle, scratch_.end());
+    stats_.frameIntervalMs = static_cast<int>(scratch_[middle]);
 }
 
 int64_t DelayEstimator::percentileOffset(int percentile) const {
@@ -190,4 +203,6 @@ void DelayEstimator::reset() {
     stats_.currentDelayMs = targetDelayMs_;
     stats_.rawDelayMs = targetDelayMs_;
     stats_.peakDelayMs = targetDelayMs_;
+    stats_.effectiveMinDelayMs = config_.minDelayMs;
+    stats_.rttMs = rttMs_;
 }

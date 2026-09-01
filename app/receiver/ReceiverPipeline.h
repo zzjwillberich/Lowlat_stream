@@ -226,6 +226,16 @@ struct ReceiverPipelineStats {
     /** @brief 量到的 RTT 样本数; 为 0 时上面那个数没有意义 */
     uint64_t rttSamples = 0;
 
+    /**
+     * @brief 已请求重传、还在等回包的 seq 数 (M4.6)
+     *
+     * @note 存在的唯一理由是**让"这张表不许无限涨"变成可测的**。
+     *       请求出去的包可能永远回不来(那正是 givenUp 的含义), 不设上限就是
+     *       安静地涨内存 —— 而"安静"意味着没有任何测试能发现它。
+     *       同 NackTrackerConfig::windowPackets 和 FrameAssembler::maxPendingFrames。
+     */
+    size_t rttPending = 0;
+
     /** @brief 解码器的计数器快照; framesMissingMeta 稳态下应当恒为 0 */
     DecoderStats decoder;
 
@@ -721,6 +731,7 @@ private:
 
     std::atomic<int> rttMs_{0};
     std::atomic<uint64_t> rttSampleCount_{0};
+    std::atomic<size_t> rttPendingCount_{0};
 
     /** @brief M4.4 统计, 收包线程独占写 */
     std::atomic<uint64_t> pliSent_{0};
