@@ -479,7 +479,8 @@ V4L2 路径因此能进 CI 和压测。教训是**先问要验证什么，再决
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — 模块划分与线程模型
 - [docs/PROTOCOL.md](docs/PROTOCOL.md) — 自研 UDP 协议设计
 - [docs/CONVENTIONS.md](docs/CONVENTIONS.md) — 工程规范
-- [docs/NOTES.md](docs/NOTES.md) — 踩坑记录
+- [docs/NOTES.md](docs/NOTES.md) — 踩坑记录（写代码时踩的）
+- [docs/测试记录.md](docs/%E6%B5%8B%E8%AF%95%E8%AE%B0%E5%BD%95.md) — 测试记录（测量时踩的，按轮次追加）
 
 各里程碑的详细拆解与设计理由：
 [M0 工程骨架](docs/M0_工程骨架.md) ·
