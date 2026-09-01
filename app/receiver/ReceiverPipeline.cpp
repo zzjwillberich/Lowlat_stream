@@ -482,7 +482,7 @@ void ReceiverPipeline::renderLoop(const std::atomic<bool>& stopRequested) {
             const LatencySummary window = summarizeLatency(latencyWindow_);
             LOG_INFO("receiver",
                      "fps=%llu latency samples=%llu p50=%ums p95=%ums | queueA=%zu queueB=%zu "
-                     "dropped=%llu resyncs=%llu assembler_lost=%llu jitter_delay=%dms",
+                     "dropped=%llu resyncs=%llu assembler_lost=%llu jitter_delay=%dms rtt=%dms",
                      static_cast<unsigned long long>(fps),
                      static_cast<unsigned long long>(window.samples), window.p50Ms, window.p95Ms,
                      queueA_.size(), queueB_.size(),
@@ -493,7 +493,7 @@ void ReceiverPipeline::renderLoop(const std::atomic<bool>& stopRequested) {
                                                      snapshot.renderQueueDropped),
                      static_cast<unsigned long long>(snapshot.decodeResyncs),
                      static_cast<unsigned long long>(snapshot.assembler.packetsLost()),
-                     snapshot.delay.currentDelayMs);
+                     snapshot.delay.currentDelayMs, snapshot.rttMs);
             latencyWindow_.reset();
             lastStatsMs = now;
             lastRendered = renderedNow;
@@ -533,6 +533,8 @@ void ReceiverPipeline::publishRecvStats() {
     shared_.assembler = assembler_.stats();
     shared_.jitter = jitter_.stats();
     shared_.delay = jitter_.delayStats();
+    shared_.rttMs = rttMs_.load();
+    shared_.rttSamples = rttSampleCount_.load();
     shared_.decodeQueuePeak = queueA_.peak();
     shared_.renderQueuePeak = queueB_.peak();
     shared_.decodeQueueDropped = queueA_.dropped() + decodeQueueRejected_.load();
@@ -610,6 +612,39 @@ bool ReceiverPipeline::requestKeyFrame(uint64_t nowMs) {
     return true;
 }
 
+void ReceiverPipeline::recordNackSent(const std::vector<uint32_t>& seqs, uint64_t nowMs) {
+    // TODO(M4.6):
+    //   1. 逐个 seq 写进 nackSentAtMs_。**已经在表里的不要覆盖** ——
+    //      重发第二次时覆盖成新时刻, 量出来的就是"第二次请求到回包"的时间,
+    //      比真实 RTT 短。第一次请求的时刻才是这一趟的起点。
+    //   2. 表超过 kRttPendingMax 就从**最老的 seq** 开始丢
+    //      (std::map 按 seq 有序, begin() 就是最老的 —— 除非 seq 回绕了,
+    //       而那种情况下丢错几个只影响 RTT 采样, 不影响正确性)。
+    (void)seqs;
+    (void)nowMs;
+}
+
+void ReceiverPipeline::observeRetransmit(const uint8_t* packet, size_t len,
+                                         uint64_t nowMs) {
+    // TODO(M4.6):
+    //   1. 解包头; 不是 Data 就返回
+    //   2. 解 DataHeader; 没有 FLAG_RETRANSMIT 就返回
+    //      **这一步不能省**: 请求刚发出去、原包正好到达是常事,
+    //      把它当成重传会量出接近 0 的 RTT, 而 RTT 要去当水位下限 ——
+    //      低估的下限比没有下限更糟, 因为它看起来像是量过的。
+    //   3. 在 nackSentAtMs_ 里找这个 seq; 找不到就返回
+    //   4. rtt = nowMs - sentAt; **nowMs < sentAt 时直接丢弃这个样本**
+    //      (同 RetransmitCache::evictExpired 的倒退时钟守卫)
+    //   5. 从表里删掉这个 seq, rtt 压进 rttSamples_, 超过 kRttWindow 弹掉最老的
+    //   6. 取中位数写进 rttMs_(atomic), ++rttSampleCount_
+    //   7. jitter_.setRttMs(中位数)
+    //      **jitter_ 归收包线程独占**, 而本函数也在收包线程里 —— 不需要加锁。
+    //      要是哪天挪到别的线程, 这一句就得改。
+    (void)packet;
+    (void)len;
+    (void)nowMs;
+}
+
 void ReceiverPipeline::requestRetransmissions(const uint8_t* packet, size_t len) {
     if (config_.nack.windowPackets == 0) return;
 
@@ -671,6 +706,9 @@ void ReceiverPipeline::requestRetransmissions(const uint8_t* packet, size_t len)
     const Status sendStatus = socket_.sendTo(peer_, nackBuf_.data(), nackLen);
     if (sendStatus.isOk()) {
         ++nackPacketsSent_;
+        // TODO(M4.6): recordNackSent(nackTargets_, steadyNowMs());
+        //   放在 isOk() 里面 —— 没发出去的请求不该等回包, 否则表里会积一堆
+        //   永远等不到的 seq, 把真正在飞的挤掉。
     } else {
         ++nackSendErrors_;
     }

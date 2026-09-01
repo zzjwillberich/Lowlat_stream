@@ -9,7 +9,9 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -208,6 +210,21 @@ struct ReceiverPipelineStats {
      *          做差没有意义。周期统计里它们要按"当前值"打印, 不是按增量。
      */
     DelayEstimatorStats delay;
+
+    /**
+     * @brief 实测重传往返(毫秒); 0 表示这一趟一次都没量到 (M4.6)
+     *
+     * @note 量法: 记下每个 seq 是什么时候被 NACK 请求的, 它的重传包
+     *          (FLAG_RETRANSMIT)回来时做差。**这是整条链路唯一的 RTT 数字** ——
+     *          M4.5 第四轮才发现"重传一直在成功、只是回来得太晚",
+     *          而当时手上没有任何 RTT 的量, 只能靠 netem 的配置值反推。
+     *
+     * @note 它同时是水位下限的输入(见 DelayEstimator::setRttMs)。
+     */
+    int rttMs = 0;
+
+    /** @brief 量到的 RTT 样本数; 为 0 时上面那个数没有意义 */
+    uint64_t rttSamples = 0;
 
     /** @brief 解码器的计数器快照; framesMissingMeta 稳态下应当恒为 0 */
     DecoderStats decoder;
@@ -491,6 +508,28 @@ private:
      */
     bool requestKeyFrame(uint64_t nowMs);
 
+    /**
+     * @brief 记下这一批 seq 的重传请求时刻, 供 RTT 计算 (M4.6)
+     *
+     * @param seqs  本次 NACK 里带的 seq
+     * @param nowMs 发出时刻
+     *
+     * @note 只在**真的发出去之后**调用 —— sendTo 失败的请求不该等回包。
+     */
+    void recordNackSent(const std::vector<uint32_t>& seqs, uint64_t nowMs);
+
+    /**
+     * @brief 一个重传包回来了, 试着量一次 RTT (M4.6)
+     *
+     * @param packet 完整的包
+     * @param len    长度
+     * @param nowMs  到达时刻
+     *
+     * @note 只认带 FLAG_RETRANSMIT 的 DATA 包。普通包的 seq 也可能在表里
+     *          (请求发出去的同时原包正好到了), 那不是重传, 算进去会把 RTT 低估成 0。
+     */
+    void observeRetransmit(const uint8_t* packet, size_t len, uint64_t nowMs);
+
     /** @brief 队列 A -> Decoder -> 队列 B */
     void decodeLoop(const std::atomic<bool>& stopRequested);
 
@@ -655,6 +694,33 @@ private:
      *          那是个累计值, 直接判"非 0 就发"会每个包都发一次。
      */
     uint64_t seenKeyFramesGivenUp_ = 0;
+
+    /**
+     * @brief 已请求重传、还没等到回包的 seq -> 请求时刻 (M4.6)
+     *
+     * @note **必须有上限**: 请求出去的包可能永远回不来(这正是 givenUp 的含义),
+     *          不清理就是安静地涨内存 —— 同 NackTrackerConfig::windowPackets
+     *          和 FrameAssembler::maxPendingFrames 那两条。
+     *          做法是超过 kRttPendingMax 就丢掉最老的。
+     */
+    std::map<uint32_t, uint64_t> nackSentAtMs_;
+
+    /** @brief 最近若干个 RTT 样本(毫秒), 取中位数 */
+    std::deque<int> rttSamples_;
+
+    static constexpr size_t kRttPendingMax = 256;
+
+    /**
+     * @brief RTT 取几个样本的中位数
+     *
+     * @note 用中位数不用最小值: 这个数要去当水位的**下限**, 而下限的作用是
+     *          "接得住重传"。取最小值等于按最顺的那一趟定预算, 大半的重传照样赶不上。
+     *          也不取最大值 —— 一次超时重传就能把水位顶穿。
+     */
+    static constexpr size_t kRttWindow = 21;
+
+    std::atomic<int> rttMs_{0};
+    std::atomic<uint64_t> rttSampleCount_{0};
 
     /** @brief M4.4 统计, 收包线程独占写 */
     std::atomic<uint64_t> pliSent_{0};

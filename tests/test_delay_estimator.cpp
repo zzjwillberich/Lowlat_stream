@@ -513,3 +513,148 @@ TEST(DelayEstimatorResponse, RisesWithinTheDocumentedWindowFraction) {
     EXPECT_GE(est.stats().currentDelayMs, 90)
         << "5% 的窗口时间内水位就该跟上, 这是选 windowMs 的依据";
 }
+
+
+// ---------------------------------------------------------------- M4.6 重传预算下限
+
+/**
+ * 帧周期是量出来的, 不是配的。
+ *
+ * 33ms 一帧喂进去, 帧周期就该是 33 —— 它是水位下限的一半原料。
+ */
+TEST(DelayEstimatorBudget, MeasuresTheFrameIntervalFromTimestamps) {
+    DelayEstimatorConfig cfg = adaptiveCfg();
+    DelayEstimator est(cfg);
+
+    uint64_t send = 100000;
+    uint64_t now = 0;
+    feedSteady(est, 60, send, now, 33, 5);
+
+    EXPECT_NEAR(est.stats().frameIntervalMs, 33, 1);
+}
+
+/**
+ * 帧周期用**中位数**, 一次乱序歪不了它。
+ *
+ * 乱序时相邻两帧的时间戳差会变成 0 或两倍, 用均值会被拖偏。
+ */
+TEST(DelayEstimatorBudget, TheFrameIntervalSurvivesReordering) {
+    DelayEstimatorConfig cfg = adaptiveCfg();
+    DelayEstimator est(cfg);
+
+    // 33ms 一帧, 但每 5 帧把相邻两帧调个个儿
+    uint64_t base = 100000;
+    for (int i = 0; i < 60; ++i) {
+        int j = (i % 5 == 3) ? i + 1 : (i % 5 == 4) ? i - 1 : i;
+        const uint64_t ts = base + static_cast<uint64_t>(j) * 33;
+        est.observe(static_cast<uint32_t>(ts), base + static_cast<uint64_t>(i) * 33 + 5);
+    }
+    EXPECT_NEAR(est.stats().frameIntervalMs, 33, 4);
+}
+
+/**
+ * timestampMs 回绕不能把帧周期顶到天上。
+ *
+ * 无符号减法在回绕点给出十亿级的差 —— 一个样本就够。
+ * 必须用 int32_t 做差。
+ */
+TEST(DelayEstimatorBudget, AWrappedTimestampDoesNotBlowTheFrameInterval) {
+    DelayEstimatorConfig cfg = adaptiveCfg();
+    DelayEstimator est(cfg);
+
+    // 跨过 2^32 边界: ...FFFFFF9C, FFFFFFBD, ..., 然后回绕到 0x0000000E
+    uint32_t ts = 0xFFFFFF00u;
+    for (int i = 0; i < 40; ++i, ts += 33) {
+        est.observe(ts, 100000 + static_cast<uint64_t>(i) * 33);
+    }
+    EXPECT_NEAR(est.stats().frameIntervalMs, 33, 2)
+        << "回绕点用无符号减法, 一个样本就能把帧周期顶到十亿";
+}
+
+/**
+ * 给了 RTT 之后, 水位下限抬到 帧周期 + RTT。
+ *
+ * 这是这一层存在的理由: 一帧缺片时补齐它要 检测延迟(一个帧周期) + RTT,
+ * 水位低于这个和, 重传回来必然已经过了 playAt —— 白跑一趟带宽,
+ * 而丢的那一帧会连累到下一个 IDR 为止的所有帧。
+ */
+TEST(DelayEstimatorBudget, TheFloorRisesToOneFramePlusRtt) {
+    DelayEstimatorConfig cfg = adaptiveCfg();
+    cfg.minDelayMs = 5;
+    cfg.minSamples = 1;
+    DelayEstimator est(cfg);
+
+    est.setRttMs(50);
+
+    uint64_t send = 100000;
+    uint64_t now = 0;
+    feedSteady(est, 60, send, now, 33, 5);  // 零抖动 -> 原始估计是 0
+
+    EXPECT_EQ(est.stats().rawDelayMs, 0) << "链路是干净的, 原始估计该是 0";
+    EXPECT_NEAR(est.stats().currentDelayMs, 33 + 50, 2)
+        << "水位应当被重传预算托住, 而不是掉到 minDelayMs";
+    EXPECT_TRUE(est.stats().floorFromBudget);
+    EXPECT_NEAR(est.stats().effectiveMinDelayMs, 33 + 50, 2);
+}
+
+/**
+ * 没给 RTT 时下限就是 minDelayMs —— 预算不许凭空出现。
+ */
+TEST(DelayEstimatorBudget, WithoutAnRttMeasurementTheFloorIsJustMinDelay) {
+    DelayEstimatorConfig cfg = adaptiveCfg();
+    cfg.minDelayMs = 5;
+    cfg.minSamples = 1;
+    DelayEstimator est(cfg);
+
+    uint64_t send = 100000;
+    uint64_t now = 0;
+    feedSteady(est, 60, send, now, 33, 5);
+
+    EXPECT_EQ(est.stats().currentDelayMs, 5);
+    EXPECT_FALSE(est.stats().floorFromBudget);
+}
+
+/**
+ * 预算再大也不许突破 maxDelayMs。
+ *
+ * RTT 一旦测歪(比如把一次超时重传当成正常往返), 预算能算出几秒。
+ * 而 maxDelayMs 是**产品定义**的上限——过 500ms README 第一行就不成立,
+ * 不能被一个测量值突破。
+ */
+TEST(DelayEstimatorBudget, TheBudgetCannotBreakThroughMaxDelay) {
+    DelayEstimatorConfig cfg = adaptiveCfg();
+    cfg.minDelayMs = 5;
+    cfg.maxDelayMs = 200;
+    cfg.minSamples = 1;
+    DelayEstimator est(cfg);
+
+    est.setRttMs(5000);  // 测歪了
+
+    uint64_t send = 100000;
+    uint64_t now = 0;
+    feedSteady(est, 60, send, now, 33, 5);
+
+    EXPECT_LE(est.stats().currentDelayMs, 200);
+}
+
+/**
+ * setRttMs(0) 表示"还不知道", 不该把已经量到的 RTT 抹掉。
+ */
+TEST(DelayEstimatorBudget, ANonPositiveRttIsIgnoredNotStored) {
+    DelayEstimatorConfig cfg = adaptiveCfg();
+    cfg.minDelayMs = 5;
+    cfg.minSamples = 1;
+    DelayEstimator est(cfg);
+
+    est.setRttMs(40);
+    uint64_t send = 100000;
+    uint64_t now = 0;
+    feedSteady(est, 40, send, now, 33, 5);
+    const int withRtt = est.stats().currentDelayMs;
+    ASSERT_GT(withRtt, 5);
+
+    est.setRttMs(0);
+    est.setRttMs(-1);
+    feedSteady(est, 40, send, now, 33, 5);
+    EXPECT_EQ(est.stats().currentDelayMs, withRtt) << "0 / 负数是'不知道', 不是'清零'";
+}

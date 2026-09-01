@@ -124,7 +124,9 @@ int main(int argc, char** argv) {
              "lost_exact=%llu nack_pending=%zu "
              "fec_recv=%llu fec_recovered=%llu fec_unrecoverable=%llu "
              "pli_sent=%llu pli_suppressed=%llu "
-             "jitter_delay=%dms jitter_peak=%dms jitter_raw=%dms decoded=%llu "
+             "jitter_delay=%dms jitter_peak=%dms jitter_raw=%dms "
+             "jitter_floor=%dms floor_src=%s frame_int=%dms rtt=%dms rtt_n=%llu "
+             "sampled_dropped=%llu decoded=%llu "
              "rendered=%llu queue_peak=%zu/%zu elapsed=%llums",
              static_cast<unsigned long long>(stats.framesWritten),
              static_cast<unsigned long long>(stats.bytesWritten),
@@ -154,6 +156,11 @@ int main(int argc, char** argv) {
              static_cast<unsigned long long>(stats.pliSuppressed),
              stats.delay.currentDelayMs, stats.delay.peakDelayMs,
              stats.delay.rawDelayMs,
+             stats.delay.effectiveMinDelayMs,
+             stats.delay.floorFromBudget ? "budget" : "min",
+             stats.delay.frameIntervalMs, stats.rttMs,
+             static_cast<unsigned long long>(stats.rttSamples),
+             static_cast<unsigned long long>(stats.jitter.framesSampledButDropped),
              static_cast<unsigned long long>(stats.decoder.framesOut),
              static_cast<unsigned long long>(stats.renderer.framesRendered),
              stats.decodeQueuePeak, stats.renderQueuePeak,

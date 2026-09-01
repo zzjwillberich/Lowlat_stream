@@ -32,6 +32,31 @@ void JitterBuffer::push(AssembledFrame frame, uint64_t nowMs) {
     // 只给收下的帧扩展, 连丢一串之后锚点就跟丢了
     const uint64_t extended = extendFrameId(frame.frameId);
 
+    // 查重必须在采样之前: 整帧重传会让同一帧到达两次, 而第二次的 offset
+    // 不是"一帧走了多久", 是重传的产物。一帧只该贡献一个样本。
+    if (pending_.find(extended) != pending_.end()) {
+        ++stats_.framesDuplicate;
+        return;
+    }
+
+    // TODO(M4.6) 采样点前移 —— **这一句必须在下面两个 return 之前**。
+    //
+    //   const uint64_t playAtMs = computePlayAt(frame.timestampMs, nowMs);
+    //
+    //   原来它在函数末尾, 于是"太晚"和"起播前"的帧在走到它之前就 return 了,
+    //   **永远不会成为水位估计器的样本**。后果实测(M4.5 第四轮 g4/rtt50):
+    //   估计器只看得到准时到达的帧 —— 那些按定义就是快的 —— p95 偏小,
+    //   水位收窄, 于是更多帧迟到, 采样更加只剩快的。正反馈。
+    //   三个种子里两个掉进坏平衡点: 水位从初值 50 一路衰减到下限 10 从未回升,
+    //   同期 150 帧因太晚被丢, 只渲染出 632/1000; 第三个种子锁在 87ms, 渲染 980。
+    //   同样的配置同样的链路, 结果差 1.6 倍。
+    //
+    //   **幸存者偏差长在控制器自己的输入上**: 估计器看不见证明它错了的那些帧。
+    //
+    //   采样之后照常判"起播前"和"太晚"并 return —— 这一帧确实不播,
+    //   但它到得多晚这件事必须被记下来。计到 framesSampledButDropped。
+    (void)nowMs;
+
     if (!started_) {
         if (!frame.isKey) {
             ++stats_.framesBeforeKey;
@@ -43,11 +68,6 @@ void JitterBuffer::push(AssembledFrame frame, uint64_t nowMs) {
     // <= 而不是 <: 相等就是已经放出去过的那一帧本身, 整帧重传会造出这种输入
     if (hasOutput_ && extended <= lastOutExtended_) {
         ++stats_.framesTooLate;
-        return;
-    }
-
-    if (pending_.find(extended) != pending_.end()) {
-        ++stats_.framesDuplicate;
         return;
     }
 
@@ -100,6 +120,8 @@ void JitterBuffer::reset() {
     started_ = !config_.startOnKeyFrame;
     stats_ = {};
 }
+
+void JitterBuffer::setRttMs(int rttMs) { estimator_.setRttMs(rttMs); }
 
 void JitterBuffer::dropUntilKeyFrame() {
     // 这是下游跟不上时的局部重启，不是重连：帧号扩展锚、时钟映射和已交付水位都

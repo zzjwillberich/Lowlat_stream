@@ -29,6 +29,7 @@ uint64_t DelayEstimator::observe(uint32_t timestampMs, uint64_t nowMs) {
     const int64_t offset =
         static_cast<int64_t>(nowMs) - static_cast<int64_t>(timestampMs);
     ++stats_.samplesSeen;
+    updateFrameInterval(timestampMs);
 
     if (!config_.adaptive) {
         if (!hasFloor_ || offset < floorOffsetMs_) {
@@ -106,6 +107,18 @@ uint64_t DelayEstimator::observe(uint32_t timestampMs, uint64_t nowMs) {
         }
     }
 
+    // TODO(M4.6) 下限改成 max(minDelayMs, 帧周期 + RTT):
+    //   const int budget = (rttMs_ > 0 && stats_.frameIntervalMs > 0)
+    //                          ? stats_.frameIntervalMs + rttMs_ : 0;
+    //   const int floor = std::max(config_.minDelayMs, budget);
+    //   stats_.effectiveMinDelayMs = floor;
+    //   stats_.floorFromBudget = budget > config_.minDelayMs;
+    //   然后拿 floor 代替下面的 config_.minDelayMs。
+    //
+    //   **上限仍然优先**: RTT 测歪了的话 floor 可能大过 maxDelayMs,
+    //   而 maxDelayMs 是产品定义的上限(过 500ms README 第一行就不成立),
+    //   不能被一个测量值突破。所以顺序是先判上限、再判下限,
+    //   且 floor 自己也要先夹进 [minDelayMs, maxDelayMs]。
     if (targetDelayMs_ > config_.maxDelayMs) {
         targetDelayMs_ = config_.maxDelayMs;
         ++stats_.clampedHigh;
@@ -124,6 +137,24 @@ uint64_t DelayEstimator::observe(uint32_t timestampMs, uint64_t nowMs) {
     const int64_t playAt = static_cast<int64_t>(timestampMs) + floorOffsetMs_ +
                            static_cast<int64_t>(targetDelayMs_);
     return playAt < 0 ? 0 : static_cast<uint64_t>(playAt);
+}
+
+void DelayEstimator::setRttMs(int rttMs) {
+    // TODO(M4.6): rttMs > 0 时记进 rttMs_ 并同步 stats_.rttMs; <= 0 忽略(保持旧值)。
+    //   **不要**在这里改 targetDelayMs_ —— 预算只抬下限, 下限在 observe 里参与夹取。
+    (void)rttMs;
+}
+
+void DelayEstimator::updateFrameInterval(uint32_t timestampMs) {
+    // TODO(M4.6):
+    //   1. 第一帧只记 lastTimestampMs_ / hasLastTimestamp_ 就返回
+    //   2. delta = abs(static_cast<int32_t>(timestampMs - lastTimestampMs_))
+    //      **必须用 int32_t 做差**: timestampMs 会回绕, 无符号减法在回绕点
+    //      给出十亿级的差, 一个样本就能把帧周期顶到天上。
+    //   3. delta 压进 frameDeltas_, 超过 kFrameDeltaWindow 就从前面弹掉
+    //   4. 取中位数(拷一份用 nth_element, 同 percentileOffset)写进 stats_.frameIntervalMs
+    //   **中位数不是均值**: 帧乱序时相邻差值会是 0 或两倍, 均值被拖偏而中位数不会。
+    (void)timestampMs;
 }
 
 int64_t DelayEstimator::percentileOffset(int percentile) const {
@@ -150,6 +181,11 @@ void DelayEstimator::reset() {
     lastObserveMs_ = 0;
     hasLastObserve_ = false;
     downRateRemainder_ = 0;
+    frameDeltas_.clear();
+    lastTimestampMs_ = 0;
+    hasLastTimestamp_ = false;
+    // rttMs_ **不清**: 换对端不改变这条链路的往返时间, 而重新测一次要好几秒,
+    // 那几秒里水位没有下限保护 —— 正是最容易掉进坏平衡点的时候。
     stats_ = {};
     stats_.currentDelayMs = targetDelayMs_;
     stats_.rawDelayMs = targetDelayMs_;

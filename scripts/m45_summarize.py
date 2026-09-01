@@ -72,6 +72,10 @@ def main():
         "encoded_bytes", "fec/encoded", "上线包数",
         # 延迟与水位
         "p50", "p95", "p99", "max", "水位", "水位峰值",
+        # M4.6: 下限是不是被重传预算托着, 以及迟到的帧有没有被采样。
+        # sampled_dropped 为 0 而 jitter_dropped 不为 0, 就是采样点又跑到 return
+        # 后面去了 —— 那个 bug 的表现是水位在最需要变大的时候反而收窄。
+        "下限", "下限来源", "帧周期", "RTT", "RTT样本", "采样但丢弃",
     ])
 
     for (group, cell), rs in cells.items():
@@ -139,6 +143,9 @@ def main():
             fmt(avg("lat_p50")), fmt(avg("lat_p95")), fmt(avg("lat_p99")),
             fmt(avg("lat_max")),
             fmt(avg("rx_jitter_delay")), fmt(avg("rx_jitter_peak")),
+            fmt(avg("rx_jitter_floor")), rs[0].get("rx_floor_src", ""),
+            fmt(avg("rx_frame_int")), fmt(avg("rx_rtt")), fmt(avg("rx_rtt_n")),
+            fmt(avg("rx_sampled_dropped")),
         ])
 
         # arrived 目前只用于下面这条自检, 留着是因为它是唯一能交叉验证

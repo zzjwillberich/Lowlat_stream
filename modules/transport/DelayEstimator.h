@@ -100,12 +100,20 @@ struct DelayEstimatorConfig {
     int floorPercentile = 5;
 
     /**
-     * @brief 水位下限(毫秒)
+     * @brief 水位的**绝对**下限(毫秒); 实际下限还会被重传预算抬高
      *
      * @note 不设下限的话, 一条太顺的链路(本地回环: 抖动几乎为 0)会把水位收到 0,
      *          而水位 0 的含义是"任何比前一帧晚到的帧都丢" —— 一个抖动就掉帧。
+     *
+     * @note **这个数不再承担"接得住重传"的职责** —— 那由重传预算负责,
+     *          见 setRttMs。M4.5 第一轮 10 这个值背了两条罪:
+     *          低丢包时接不住重传往返(3%/5% 的成绩反而比 10% 差),
+     *          以及在第四轮里成了坏平衡点的落脚处。两条都不是"绝对下限"该管的事。
+     *
+     * @note 实际生效的下限是 `max(minDelayMs, 帧周期 + RTT)`。
+     *          两者哪个在起作用, 看 stats 的 floorFromBudget。
      */
-    int minDelayMs = 10;
+    int minDelayMs = 5;
 
     /**
      * @brief 水位上限(毫秒)
@@ -195,8 +203,26 @@ struct DelayEstimatorStats {
     /** @brief 被 maxDelayMs 夹住的次数; **非 0 就要查**, 见 maxDelayMs 的 @note */
     uint64_t clampedHigh = 0;
 
-    /** @brief 被 minDelayMs 夹住的次数; 非 0 只说明链路比下限还稳, 不是问题 */
+    /**
+     * @brief 被下限夹住的次数
+     *
+     * @note 非 0 本身不是问题(链路比下限还稳)。但要配着 floorFromBudget 一起看:
+     *          下限来自重传预算而且频繁夹住, 说明**水位是被预算撑着的**,
+     *          不是网络要求的 —— 那时该问的是重传值不值这个延迟。
+     */
     uint64_t clampedLow = 0;
+
+    /** @brief 当前生效的下限(毫秒) = max(minDelayMs, 帧周期 + RTT) */
+    int effectiveMinDelayMs = 0;
+
+    /** @brief 当前生效的下限是不是由重传预算给出的(而非 minDelayMs) */
+    bool floorFromBudget = false;
+
+    /** @brief 实测帧周期(毫秒); 由相邻 timestampMs 的差值中位数得到 */
+    int frameIntervalMs = 0;
+
+    /** @brief 外部喂进来的实测 RTT(毫秒); 0 表示还不知道 */
+    int rttMs = 0;
 };
 
 /**
@@ -257,6 +283,34 @@ public:
      */
     uint64_t observe(uint32_t timestampMs, uint64_t nowMs);
 
+    /**
+     * @brief 告诉估计器当前实测的重传往返(毫秒)
+     *
+     * @param rttMs 实测 RTT; <= 0 表示"还不知道", 忽略
+     *
+     * @note 它**不直接决定水位**, 只抬高水位的下限:
+     *          @code
+     *          实际下限 = max(config_.minDelayMs, 帧周期 + rttMs)
+     *          @endcode
+     *
+     * @note 为什么下限要含重传预算: 一帧缺了分片时, 补齐它需要
+     *          **检测延迟 + RTT**。检测延迟是"再收到一帧的包数那么多个更新的包"
+     *          (见 NackTrackerConfig 的推导, 恒等于一个帧周期, 与码率无关)。
+     *          水位低于这个和, 重传回来的帧必然已经过了 playAt —— 白跑一趟带宽,
+     *          而且丢的那一帧会连累到下一个 IDR 为止的所有帧。
+     *
+     * @note 为什么是**下限**而不是水位本身: 高丢包时 p95 自己就会涨到这个量级
+     *          (一帧 8 个分片、10% 丢包下 1-0.9^8 = 57% 的帧要等重传,
+     *          远超 5% 的分位阈值), 那时预算是多余的。
+     *          预算真正管用的是**低丢包**那一段: 0.5% 丢包下只有 3.9% 的帧要等重传,
+     *          落不进 p95, 于是这些帧被静默丢掉 —— 正是 M4.5 第一轮
+     *          "3%/5% 丢包的成绩反而比 10% 差"的成因。
+     *
+     * @note 帧周期不用配置: 相邻 timestampMs 的差值就是它, 本类自己量。
+     *          RTT 本类量不了(它不认识包, 也不知道 NACK 什么时候发的), 所以由外部喂。
+     */
+    void setRttMs(int rttMs);
+
     /** @brief 当前生效的水位(毫秒) */
     int currentDelayMs() const { return stats_.currentDelayMs; }
 
@@ -274,6 +328,17 @@ public:
     void reset();
 
 private:
+    /**
+     * @brief 用最近的 timestampMs 差值更新帧周期估计
+     *
+     * @param timestampMs 本帧的发送端时间戳
+     *
+     * @note 取**中位数**而不是均值: 帧会乱序到达, 乱序时相邻两帧的差值是负的或很大,
+     *          均值会被拖偏而中位数不会。差值取绝对值, 且用 int32 做差
+     *          (timestampMs 会回绕, 无符号减法在回绕点给出十亿级的差)。
+     */
+    void updateFrameInterval(uint32_t timestampMs);
+
     /**
      * @brief 取窗口内 offset 的第 p 分位
      *
@@ -317,4 +382,20 @@ private:
 
     /** @brief 下调限速除以 1000 后留下的余数, 避免逐帧小 dt 永远截成 0 */
     uint64_t downRateRemainder_ = 0;
+
+    /** @brief 外部喂进来的实测 RTT; 0 = 还不知道 */
+    int rttMs_ = 0;
+
+    /** @brief 最近若干个相邻 timestampMs 的差值(毫秒), 取中位数当帧周期 */
+    std::deque<int> frameDeltas_;
+    uint32_t lastTimestampMs_ = 0;
+    bool hasLastTimestamp_ = false;
+
+    /**
+     * @brief 帧周期估计要攒几个差值
+     *
+     * @note 别取太大: 帧率变化时它要跟得上。也别取太小: 一次乱序就能歪掉。
+     *          15 个 @30fps 是半秒。
+     */
+    static constexpr size_t kFrameDeltaWindow = 15;
 };

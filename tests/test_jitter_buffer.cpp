@@ -414,3 +414,110 @@ TEST(JitterBuffer, EveryFrameIsAccountedForExactlyOnce) {
                   s.framesBeforeKey + jb.size(),
               s.framesIn);
 }
+
+
+// ---------------------------------------------------------------- M4.6 迟到的帧也要采样
+
+/**
+ * 迟到的帧被丢掉之前, 必须先喂给水位估计器。
+ *
+ * 这是 M4.5 第四轮那个 bug 的契约: 采样点原本在两个 return 之后,
+ * 于是"太晚"的帧永远不会成为样本。后果是估计器只看得到准时到达的帧 ——
+ * 那些按定义就是快的 —— p95 偏小, 水位收窄, 更多帧迟到, 采样更加只剩快的。
+ * 正反馈, 而且系统变成双稳: 同样的配置同样的链路, 渲染数能差 1.6 倍。
+ *
+ * **幸存者偏差长在控制器自己的输入上。**
+ */
+TEST(JitterBuffer, ALateFrameStillFeedsTheDelayEstimator) {
+    JitterBufferConfig cfg = noKeyGate(/*targetDelayMs=*/20);
+    cfg.delay.adaptive = true;
+    cfg.delay.minSamples = 1;
+    cfg.delay.minDelayMs = 0;
+    cfg.delay.maxDelayMs = 10000;
+    cfg.delay.downRateMsPerSec = 0;
+    JitterBuffer jb(cfg);
+
+    // 先正常交付几帧, 把交付水位推上去
+    for (uint32_t i = 0; i < 5; ++i) {
+        jb.push(makeFrame(i, /*timestampMs=*/1000 + i * 33), 2000 + i * 33);
+    }
+    AssembledFrame out;
+    uint64_t now = 2000 + 5 * 33 + 500;
+    while (jb.pop(out, now)) {
+    }
+    const uint64_t before = jb.delayStats().samplesSeen;
+    ASSERT_GT(before, 0u);
+
+    // 现在来一帧比已交付的还老 —— 一定被判 framesTooLate
+    jb.push(makeFrame(/*frameId=*/2, /*timestampMs=*/1000 + 2 * 33), now);
+
+    EXPECT_EQ(jb.stats().framesTooLate, 1u) << "构造没生效: 这一帧并没有被判太晚";
+    EXPECT_EQ(jb.delayStats().samplesSeen, before + 1)
+        << "迟到的帧没有被采样 —— 估计器看不见证明它错了的那些帧";
+    EXPECT_EQ(jb.stats().framesSampledButDropped, 1u);
+}
+
+/**
+ * 起播前被丢掉的帧也要采样 —— 同上, 少一个理由都不行。
+ */
+TEST(JitterBuffer, AFrameDroppedBeforeTheKeyGateStillFeedsTheEstimator) {
+    JitterBufferConfig cfg;
+    cfg.startOnKeyFrame = true;
+    cfg.delay.adaptive = true;
+    cfg.delay.minSamples = 1;
+    JitterBuffer jb(cfg);
+
+    jb.push(makeFrame(/*frameId=*/0, /*timestampMs=*/1000, /*isKey=*/false), 1050);
+
+    EXPECT_EQ(jb.stats().framesBeforeKey, 1u);
+    EXPECT_EQ(jb.delayStats().samplesSeen, 1u);
+    EXPECT_EQ(jb.stats().framesSampledButDropped, 1u);
+}
+
+/**
+ * 但**重复**的帧不许采样。
+ *
+ * 整帧重传会让同一帧到达两次, 而第二次的 offset 不是"一帧走了多久",
+ * 是重传的产物。一帧只该贡献一个样本, 否则慢的那一份被数了两次,
+ * p95 往上偏。
+ */
+TEST(JitterBuffer, ADuplicateFrameIsNotSampledTwice) {
+    JitterBufferConfig cfg = noKeyGate(/*targetDelayMs=*/50);
+    cfg.delay.adaptive = true;
+    cfg.delay.minSamples = 1;
+    JitterBuffer jb(cfg);
+
+    jb.push(makeFrame(/*frameId=*/7, /*timestampMs=*/1000), 1010);
+    const uint64_t after_first = jb.delayStats().samplesSeen;
+
+    jb.push(makeFrame(/*frameId=*/7, /*timestampMs=*/1000), 1200);  // 同一帧, 晚 190ms
+
+    EXPECT_EQ(jb.stats().framesDuplicate, 1u);
+    EXPECT_EQ(jb.delayStats().samplesSeen, after_first)
+        << "重复帧被采样了, 慢的那一份会被数两次";
+}
+
+/**
+ * framesSampledButDropped 必须等于两条丢弃路径之和 —— 它是那个 bug 的哨兵。
+ *
+ * 这个数为 0 而 framesTooLate 不为 0, 就说明采样点又跑到 return 后面去了。
+ */
+TEST(JitterBuffer, SampledButDroppedEqualsTooLatePlusBeforeKey) {
+    JitterBufferConfig cfg;
+    cfg.startOnKeyFrame = true;
+    cfg.delay.adaptive = true;
+    cfg.delay.minSamples = 1;
+    JitterBuffer jb(cfg);
+
+    jb.push(makeFrame(0, 1000, /*isKey=*/false), 1010);   // 起播前
+    jb.push(makeFrame(1, 1033, /*isKey=*/false), 1043);   // 起播前
+    jb.push(makeFrame(2, 1066, /*isKey=*/true), 1076);    // 起播
+    AssembledFrame out;
+    while (jb.pop(out, 5000)) {
+    }
+    jb.push(makeFrame(1, 1033, /*isKey=*/false), 5010);   // 太晚
+
+    const JitterBufferStats& s = jb.stats();
+    EXPECT_EQ(s.framesSampledButDropped, s.framesTooLate + s.framesBeforeKey);
+    EXPECT_EQ(s.framesSampledButDropped, 3u);
+}

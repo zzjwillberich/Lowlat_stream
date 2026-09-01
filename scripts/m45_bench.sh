@@ -188,7 +188,7 @@ CSV="$OUT/runs.csv"
 
 # dropped(组包器丢的整帧)第一次跑漏掉了 —— 而"组好了几帧"和"解出来几帧"
 # 之间的缺口正是这次最重要的发现, 少一个计数器就得靠推断。
-RX_KEYS="frames key packets injected_drops lost_exact nack_pending nack_sent nack_seqs nack_recovered nack_gaveup fec_recv fec_recovered fec_unrecoverable pli_sent pli_suppressed dropped jitter_dropped queue_dropped resyncs decoded rendered jitter_delay jitter_peak malformed recv_errors elapsed"
+RX_KEYS="frames key packets injected_drops lost_exact nack_pending nack_sent nack_seqs nack_recovered nack_gaveup fec_recv fec_recovered fec_unrecoverable pli_sent pli_suppressed dropped jitter_dropped queue_dropped resyncs decoded rendered jitter_delay jitter_peak jitter_floor floor_src frame_int rtt rtt_n sampled_dropped malformed recv_errors elapsed"
 TX_KEYS="captured encoded bytes key packets_sent send_errors nacks nacked_seqs retransmitted retx_misses reverse_malformed plis fec_packets fec_bytes"
 LAT_KEYS="samples p50 p95 p99 max"
 

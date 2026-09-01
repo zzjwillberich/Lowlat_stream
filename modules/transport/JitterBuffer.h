@@ -88,6 +88,16 @@ struct JitterBufferStats {
 
     /** @brief 起播前丢弃的非关键帧数 */
     uint64_t framesBeforeKey = 0;
+
+    /**
+     * @brief 喂给了水位估计器、但本身没有进入缓冲的帧数 (M4.6)
+     *
+     * @note 它等于 framesTooLate + framesBeforeKey。单独列出来是因为它回答的是
+     *          **"估计器有没有看见迟到的帧"** —— 这个数为 0 而 framesTooLate 不为 0,
+     *          就说明采样点又跑到 return 后面去了, 而那个 bug 的表现是
+     *          水位在最需要它变大的时候反而收窄(见 push 的 TODO)。
+     */
+    uint64_t framesSampledButDropped = 0;
 };
 
 /**
@@ -180,6 +190,18 @@ public:
      *          混在一起会诱使调用方把 currentDelayMs 也当成累计量去做差。
      */
     const DelayEstimatorStats& delayStats() const { return estimator_.stats(); }
+
+    /**
+     * @brief 告诉水位估计器当前实测的重传往返(毫秒)
+     *
+     * @param rttMs 实测 RTT; <= 0 表示"还不知道", 估计器会忽略
+     *
+     * @note 转发给 DelayEstimator::setRttMs, 见那里的 @note ——
+     *          它和帧周期一起构成水位的**下限**, 而不是直接决定水位。
+     * @note 本类不测 RTT: 它不认识包, 也不知道 NACK 是什么时候发的。
+     *          测量归 ReceiverPipeline, 这里只是转发。
+     */
+    void setRttMs(int rttMs);
 
     /**
      * @brief 清空全部状态(含计数器和时钟映射), 回到刚构造的样子
